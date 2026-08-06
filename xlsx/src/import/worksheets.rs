@@ -13,8 +13,8 @@ use ironcalc_base::{
         utils::{column_to_number, parse_reference_a1},
     },
     types::{
-        ArrayKind, Cell, Col, Color, Comment, DefinedName, Dxf, FormulaValue, Link, Row, SheetData,
-        SheetState, SpillValue, Table, Theme, Worksheet, WorksheetView,
+        ArrayKind, Cell, Col, Color, Comment, DefinedName, Dxf, FormulaValue, Link, RangeRef, Row,
+        SheetData, SheetState, SpillValue, Table, Theme, Worksheet, WorksheetView,
     },
 };
 use roxmltree::Node;
@@ -165,7 +165,7 @@ fn load_columns(ws: Node) -> Result<Vec<Col>, XlsxError> {
     Ok(cols)
 }
 
-fn load_merge_cells(ws: Node) -> Result<Vec<String>, XlsxError> {
+fn load_merge_cells(ws: Node) -> Result<Vec<RangeRef>, XlsxError> {
     // 18.3.1.55 Merge Cells
     // <mergeCells count="1">
     //    <mergeCell ref="K7:L10"/>
@@ -177,8 +177,19 @@ fn load_merge_cells(ws: Node) -> Result<Vec<String>, XlsxError> {
         .collect::<Vec<Node>>();
     if merge_cells_nodes.len() == 1 {
         for merge_cell in merge_cells_nodes[0].children() {
-            let reference = get_attribute(&merge_cell, "ref")?.to_string();
-            merge_cells.push(reference);
+            let reference = get_attribute(&merge_cell, "ref")?;
+            // `ST_Ref` corners always carry both a column and a row; the axis
+            // shorthand (`D:D`) is formula syntax and not valid here. A conforming
+            // whole-column ref (`A1:A1048576`) is fine and parses to an unbounded axis.
+            let is_st_ref = reference
+                .split(':')
+                .all(|p| p.contains(char::is_alphabetic) && p.contains(char::is_numeric));
+            let range = RangeRef::parse_a1(reference)
+                .filter(|_| is_st_ref)
+                .ok_or_else(|| {
+                    XlsxError::Xml(format!("Invalid merge cell reference: '{reference}'"))
+                })?;
+            merge_cells.push(range);
         }
     }
     Ok(merge_cells)
@@ -230,7 +241,12 @@ fn load_comments<R: Read + std::io::Seek>(
                 .map(|n| n.text().unwrap().to_string())
                 .collect::<Vec<String>>()
                 .join("");
-            let cell_ref = get_attribute(&comment, "ref")?.to_string();
+            let reference = get_attribute(&comment, "ref")?;
+            let cell_ref = parse_reference_a1(&reference.to_uppercase())
+                .map(|r| (r.row, r.column))
+                .ok_or_else(|| {
+                    XlsxError::Xml(format!("Invalid comment reference: '{reference}'"))
+                })?;
             // TODO: Read author_name from the list of authors
             let author_name = "".to_string();
             comments.push(Comment {
@@ -1366,9 +1382,11 @@ pub(super) fn load_sheets<R: Read + std::io::Seek>(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::{Cursor, Write};
 
     use ironcalc_base::types::Link;
 
+    use super::*;
     use crate::import::worksheets::{load_hyperlinks, parse_reference};
 
     #[test]
@@ -1416,5 +1434,54 @@ mod tests {
         assert_eq!(links.get(&(3, 2)), None);
         assert_eq!(links.get(&(4, 2)), None);
         assert_eq!(links.get(&(1, 6)), None);
+    }
+
+    #[test]
+    fn merge_cells_import_rejects_invalid_refs() {
+        let parse = |xml: &str| {
+            let doc = roxmltree::Document::parse(xml).unwrap();
+            load_merge_cells(doc.root_element())
+        };
+        let cells = parse(
+            r#"<worksheet><mergeCells count="1"><mergeCell ref="K7:L10"/></mergeCells></worksheet>"#,
+        )
+        .unwrap();
+        assert_eq!(cells, vec![RangeRef::parse_a1("K7:L10").unwrap()]);
+
+        assert!(parse(
+            r#"<worksheet><mergeCells count="1"><mergeCell ref="garbage"/></mergeCells></worksheet>"#,
+        )
+        .is_err());
+        // the axis shorthand is formula syntax, not a valid storage ref
+        assert!(parse(
+            r#"<worksheet><mergeCells count="1"><mergeCell ref="D:D"/></mergeCells></worksheet>"#,
+        )
+        .is_err());
+        // a conforming whole-column ref is accepted and normalized to unbounded rows
+        let cells = parse(
+            r#"<worksheet><mergeCells count="1"><mergeCell ref="A1:A1048576"/></mergeCells></worksheet>"#,
+        )
+        .unwrap();
+        assert_eq!(cells, vec![RangeRef::parse_a1("A:A").unwrap()]);
+    }
+
+    #[test]
+    fn comments_import_rejects_invalid_ref() {
+        let archive_with = |comments_xml: &str| {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            writer
+                .start_file("xl/comments1.xml", zip::write::FileOptions::default())
+                .unwrap();
+            writer.write_all(comments_xml.as_bytes()).unwrap();
+            zip::read::ZipArchive::new(writer.finish().unwrap()).unwrap()
+        };
+
+        let valid = r#"<comments><commentList><comment ref="B3" authorId="0"><text><t>hi</t></text></comment></commentList></comments>"#;
+        let comments = load_comments(&mut archive_with(valid), "xl/comments1.xml").unwrap();
+        assert_eq!(comments[0].cell_ref, (3, 2));
+        assert_eq!(comments[0].text, "hi");
+
+        let invalid = r#"<comments><commentList><comment ref="garbage" authorId="0"><text><t>hi</t></text></comment></commentList></comments>"#;
+        assert!(load_comments(&mut archive_with(invalid), "xl/comments1.xml").is_err());
     }
 }

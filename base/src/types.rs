@@ -259,7 +259,7 @@ pub enum Link {
     },
 }
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
@@ -275,7 +275,14 @@ pub trait Position: sealed::Sealed + Sized {
         + Serialize
         + serde::de::DeserializeOwned;
     /// Per-sheet ordering context; `()` for [`Ordinal`].
-    type SheetIndex: Clone + Default;
+    type SheetIndex: Clone + Default + std::fmt::Debug + PartialEq + Encode + bitcode::DecodeOwned;
+
+    // Key ⇄ ordinal resolution. Ordinals are the 1-based `i32` the rest of the codebase uses;
+    // `None` means the key names nothing in this index any more.
+    fn row_ordinal(idx: &Self::SheetIndex, key: &Self::Key) -> Option<i32>;
+    fn col_ordinal(idx: &Self::SheetIndex, key: &Self::Key) -> Option<i32>;
+    fn row_at(idx: &Self::SheetIndex, ordinal: i32) -> Option<Self::Key>;
+    fn col_at(idx: &Self::SheetIndex, ordinal: i32) -> Option<Self::Key>;
 }
 
 /// Positional addressing: rows and columns are 1-based indices.
@@ -292,6 +299,24 @@ impl sealed::Sealed for Ordinal {}
 impl Position for Ordinal {
     type Key = i32;
     type SheetIndex = ();
+
+    // The key *is* the ordinal, so resolution is the identity and there is nothing to bound-check.
+    #[inline]
+    fn row_ordinal(_idx: &(), key: &i32) -> Option<i32> {
+        Some(*key)
+    }
+    #[inline]
+    fn col_ordinal(_idx: &(), key: &i32) -> Option<i32> {
+        Some(*key)
+    }
+    #[inline]
+    fn row_at(_idx: &(), ordinal: i32) -> Option<i32> {
+        Some(ordinal)
+    }
+    #[inline]
+    fn col_at(_idx: &(), ordinal: i32) -> Option<i32> {
+        Some(ordinal)
+    }
 }
 
 /// A cell position: (row, column), 1-based.
@@ -434,7 +459,7 @@ impl RangeRef {
 #[derive(Encode, Decode, Debug, PartialEq, Clone)]
 pub struct Worksheet<A: Position = Ordinal> {
     pub dimension: String,
-    pub cols: Vec<Col>,
+    pub cols: Vec<Col<A>>,
     pub rows: Vec<Row<A>>,
     pub name: String,
     pub sheet_data: SheetData<A>,
@@ -452,6 +477,8 @@ pub struct Worksheet<A: Position = Ordinal> {
     pub conditional_formatting: Vec<ConditionalFormatting<A>>,
     /// Hyperlinks in the worksheet, keyed by (row, column) of the cell they are attached to
     pub links: HashMap<CellAddr<A>, Link>,
+    /// The ordering context every key in this sheet resolves against; `()` for [`Ordinal`].
+    pub index: A::SheetIndex,
 }
 
 /// Internal representation of Excel's sheet_data
@@ -473,12 +500,12 @@ pub struct Row<A: Position = Ordinal> {
 
 // ECMA-376-1:2016 section 18.3.1.13
 #[derive(Encode, Decode, Debug, PartialEq, Clone)]
-pub struct Col {
+pub struct Col<A: Position = Ordinal> {
     // Column definitions are defined on ranges, unlike rows which store unique, per-row entries.
     /// First column affected by this record. Settings apply to column in \[min, max\] range.
-    pub min: i32,
+    pub min: A::Key,
     /// Last column affected by this record. Settings apply to column in \[min, max\] range.
-    pub max: i32,
+    pub max: A::Key,
     pub width: f64,
     pub custom_width: bool,
     pub hidden: bool,

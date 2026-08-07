@@ -74,6 +74,7 @@ impl<'a> Model<'a> {
             views,
             conditional_formatting: vec![],
             links: HashMap::new(),
+            index: Default::default(),
         }
     }
 

@@ -26,7 +26,7 @@ mod test_fn_count;
 mod test_fn_depreciation;
 mod test_fn_financial_simple;
 mod test_forecast;
-mod test_stable_projection;
+pub(crate) mod test_stable_projection;
 mod test_statistical_functions;
 // FIXME: These tests are failing
 // mod test_fn_datevalue_datedif;

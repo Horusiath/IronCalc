@@ -26,6 +26,8 @@ mod test_fn_count;
 mod test_fn_depreciation;
 mod test_fn_financial_simple;
 mod test_forecast;
+// Builds stable storage out of an ordinal model, which `collab-test` no longer has.
+#[cfg(all(feature = "collab", not(feature = "collab-test")))]
 pub(crate) mod test_stable_projection;
 mod test_statistical_functions;
 // FIXME: These tests are failing
@@ -139,4 +141,6 @@ mod test_today;
 mod test_trigonometric_reciprocals;
 mod test_types;
 mod text_functions;
+// `UserModel` is ordinal-only.
+#[cfg(not(feature = "collab-test"))]
 mod user_model;

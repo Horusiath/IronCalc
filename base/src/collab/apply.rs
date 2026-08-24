@@ -504,7 +504,7 @@ impl CollabModel<'_> {
                     // index, which just shrank.
                 }
             }
-            Patch::MoveRows { sheet, moves } => {
+            Patch::MoveRows { sheet, moves, .. } => {
                 let Some(i) = self.sheet_index(*sheet) else {
                     return;
                 };
@@ -513,7 +513,7 @@ impl CollabModel<'_> {
                     index.rows.apply_move(source, dest.clone(), ts.hlc);
                 }
             }
-            Patch::MoveColumns { sheet, moves } => {
+            Patch::MoveColumns { sheet, moves, .. } => {
                 let Some(i) = self.sheet_index(*sheet) else {
                     return;
                 };
@@ -1501,6 +1501,7 @@ mod test {
             vec![Patch::MoveRows {
                 sheet: SHEET,
                 moves: vec![(rows[0].clone(), dest.clone())],
+                prev: vec![],
             }],
         ));
         log.push(Rec::new(
@@ -1612,6 +1613,7 @@ mod test {
                 Patch::MoveRows {
                     sheet: SHEET,
                     moves: vec![(rows[0].clone(), minted(&[0x00, 0x09], 1))],
+                    prev: vec![],
                 },
                 Patch::SetSheetProperty {
                     sheet: SHEET,
@@ -1645,6 +1647,7 @@ mod test {
                 Patch::MoveRows {
                     sheet: SHEET,
                     moves: vec![(rows[0].clone(), minted(&[0x00, 0x03], 2))],
+                    prev: vec![],
                 },
                 Patch::SetSheetProperty {
                     sheet: SHEET,

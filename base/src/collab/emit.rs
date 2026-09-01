@@ -1972,7 +1972,11 @@ impl CollabModel<'_> {
     }
 
     /// The name showing `name` in `scope`, matched case-insensitively as every upstream lookup is.
-    fn defined_name_id_of(&self, scope: Option<SheetId>, name: &str) -> Option<DefinedNameId> {
+    pub(crate) fn defined_name_id_of(
+        &self,
+        scope: Option<SheetId>,
+        name: &str,
+    ) -> Option<DefinedNameId> {
         let upper = name.to_uppercase();
         self.defined_name_display()
             .into_iter()
@@ -1981,7 +1985,7 @@ impl CollabModel<'_> {
     }
 
     /// The formula `id` currently holds, `None` once it has been deleted.
-    fn formula_of(&self, id: DefinedNameId) -> Option<String> {
+    pub(crate) fn formula_of(&self, id: DefinedNameId) -> Option<String> {
         let state = self.workbook.meta.defined_names.get(&id)?;
         state.formula.value.clone()
     }

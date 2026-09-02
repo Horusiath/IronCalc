@@ -6,6 +6,8 @@ mod test_ceiling_floor;
 mod test_cell;
 mod test_cell_clear_contents;
 mod test_circular_references;
+#[cfg(feature = "collab")]
+mod test_collab_oracle;
 mod test_column_width;
 mod test_criteria;
 mod test_database;
@@ -26,7 +28,6 @@ mod test_fn_count;
 mod test_fn_depreciation;
 mod test_fn_financial_simple;
 mod test_forecast;
-// Builds stable storage out of an ordinal model, which `collab-test` no longer has.
 #[cfg(all(feature = "collab", not(feature = "collab-test")))]
 pub(crate) mod test_stable_projection;
 mod test_statistical_functions;

@@ -22,7 +22,7 @@ pub struct SelectedView {
     pub left_column: i32,
 }
 
-// The representation-independent view state: selection and window geometry.
+// The representation-independent view state: selection, window geometry, navigation and scroll.
 impl<'a, A: Position> UserModel<'a, A> {
     /// Returns the selected sheet index
     pub fn get_selected_sheet(&self) -> u32 {
@@ -241,10 +241,7 @@ impl<'a, A: Position> UserModel<'a, A> {
         };
         Err("View not found".to_string())
     }
-}
 
-// Ordinal-only until the width/height/hidden accessors go generic: navigation and scroll.
-impl<'a> UserModel<'a> {
     // The UI renders every row and column at a whole number of pixels
     // (the canvas rounds each size before drawing), so all the scroll and
     // visibility arithmetic in this module must accumulate the rounded

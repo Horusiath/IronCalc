@@ -33,6 +33,8 @@ mod test_forecast;
 #[cfg(all(feature = "collab", not(feature = "collab-test")))]
 pub(crate) mod test_stable_projection;
 mod test_statistical_functions;
+#[cfg(feature = "collab")]
+mod test_user_model_oracle;
 // FIXME: These tests are failing
 // mod test_fn_datevalue_datedif;
 mod test_fn_day;

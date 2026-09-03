@@ -46,6 +46,7 @@ impl Position for Stable {
     type SheetIndex = SheetIndexes;
     type WorkbookMeta = WorkbookMeta;
     type Local = CollabSession;
+    type UserState = StableUserState;
     type Formula = StableFormula;
 
     fn row_ordinal(idx: &SheetIndexes, key: &FractionalKey) -> Option<i32> {
@@ -103,6 +104,14 @@ impl Position for Stable {
             .ok()
             .map(std::borrow::Cow::Owned)
     }
+}
+
+/// Undo/redo for a collaborative [`UserModel`](crate::UserModel): stacks of the patches a local
+/// action emitted. Declared here, but not consumed until a later round wires undo/redo up.
+#[derive(Default)]
+pub struct StableUserState {
+    pub undo_stack: Vec<Vec<Patch>>,
+    pub redo_stack: Vec<Vec<Patch>>,
 }
 
 /// The two orderings a sheet's keys resolve against, plus the sheet's write registers.

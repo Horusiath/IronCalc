@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     constants::{LAST_COLUMN, LAST_ROW},
     expressions::utils::{is_valid_column_number, is_valid_row},
+    types::Position,
     worksheet::NavigationDirection,
 };
 
@@ -21,20 +22,8 @@ pub struct SelectedView {
     pub left_column: i32,
 }
 
-impl<'a> UserModel<'a> {
-    // The UI renders every row and column at a whole number of pixels
-    // (the canvas rounds each size before drawing), so all the scroll and
-    // visibility arithmetic in this module must accumulate the rounded
-    // sizes: summing the raw values drifts away from the rendered geometry
-    // as the rounding errors pile up.
-    fn ui_row_height(&self, sheet: u32, row: i32) -> Result<f64, String> {
-        self.model.get_row_height(sheet, row).map(f64::round)
-    }
-
-    fn ui_column_width(&self, sheet: u32, column: i32) -> Result<f64, String> {
-        self.model.get_column_width(sheet, column).map(f64::round)
-    }
-
+// The representation-independent view state: selection and window geometry.
+impl<'a, A: Position> UserModel<'a, A> {
     /// Returns the selected sheet index
     pub fn get_selected_sheet(&self) -> u32 {
         if let Some(view) = self.model.workbook.views.get(&self.model.view_id) {
@@ -192,6 +181,81 @@ impl<'a> UserModel<'a> {
             }
         }
         Ok(())
+    }
+    /// Sets the value of the first visible cell
+    pub fn set_top_left_visible_cell(
+        &mut self,
+        top_row: i32,
+        left_column: i32,
+    ) -> Result<(), String> {
+        let sheet = if let Some(view) = self.model.workbook.views.get(&self.model.view_id) {
+            view.sheet
+        } else {
+            0
+        };
+
+        if !is_valid_column_number(left_column) {
+            return Err(format!("Invalid column: '{left_column}'"));
+        }
+        if !is_valid_row(top_row) {
+            return Err(format!("Invalid row: '{top_row}'"));
+        }
+        if self.model.workbook.worksheet(sheet).is_err() {
+            return Err(format!("Invalid worksheet index {sheet}"));
+        }
+        if let Ok(worksheet) = self.model.workbook.worksheet_mut(sheet) {
+            if let Some(view) = worksheet.views.get_mut(&0) {
+                view.top_row = top_row;
+                view.left_column = left_column;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sets the width of the window
+    pub fn set_window_width(&mut self, window_width: f64) {
+        if let Some(view) = self.model.workbook.views.get_mut(&self.model.view_id) {
+            view.window_width = window_width as i64;
+        };
+    }
+
+    /// Gets the width of the window
+    pub fn get_window_width(&mut self) -> Result<i64, String> {
+        if let Some(view) = self.model.workbook.views.get_mut(&self.model.view_id) {
+            return Ok(view.window_width);
+        };
+        Err("View not found".to_string())
+    }
+
+    /// Sets the height of the window
+    pub fn set_window_height(&mut self, window_height: f64) {
+        if let Some(view) = self.model.workbook.views.get_mut(&self.model.view_id) {
+            view.window_height = window_height as i64;
+        };
+    }
+
+    /// Gets the height of the window
+    pub fn get_window_height(&mut self) -> Result<i64, String> {
+        if let Some(view) = self.model.workbook.views.get_mut(&self.model.view_id) {
+            return Ok(view.window_height);
+        };
+        Err("View not found".to_string())
+    }
+}
+
+// Ordinal-only until the width/height/hidden accessors go generic: navigation and scroll.
+impl<'a> UserModel<'a> {
+    // The UI renders every row and column at a whole number of pixels
+    // (the canvas rounds each size before drawing), so all the scroll and
+    // visibility arithmetic in this module must accumulate the rounded
+    // sizes: summing the raw values drifts away from the rendered geometry
+    // as the rounding errors pile up.
+    fn ui_row_height(&self, sheet: u32, row: i32) -> Result<f64, String> {
+        self.model.get_row_height(sheet, row).map(f64::round)
+    }
+
+    fn ui_column_width(&self, sheet: u32, column: i32) -> Result<f64, String> {
+        self.model.get_column_width(sheet, column).map(f64::round)
     }
 
     /// The selected range is expanded with the keyboard
@@ -354,67 +418,6 @@ impl<'a> UserModel<'a> {
 
         Ok(())
     }
-
-    /// Sets the value of the first visible cell
-    pub fn set_top_left_visible_cell(
-        &mut self,
-        top_row: i32,
-        left_column: i32,
-    ) -> Result<(), String> {
-        let sheet = if let Some(view) = self.model.workbook.views.get(&self.model.view_id) {
-            view.sheet
-        } else {
-            0
-        };
-
-        if !is_valid_column_number(left_column) {
-            return Err(format!("Invalid column: '{left_column}'"));
-        }
-        if !is_valid_row(top_row) {
-            return Err(format!("Invalid row: '{top_row}'"));
-        }
-        if self.model.workbook.worksheet(sheet).is_err() {
-            return Err(format!("Invalid worksheet index {sheet}"));
-        }
-        if let Ok(worksheet) = self.model.workbook.worksheet_mut(sheet) {
-            if let Some(view) = worksheet.views.get_mut(&0) {
-                view.top_row = top_row;
-                view.left_column = left_column;
-            }
-        }
-        Ok(())
-    }
-
-    /// Sets the width of the window
-    pub fn set_window_width(&mut self, window_width: f64) {
-        if let Some(view) = self.model.workbook.views.get_mut(&self.model.view_id) {
-            view.window_width = window_width as i64;
-        };
-    }
-
-    /// Gets the width of the window
-    pub fn get_window_width(&mut self) -> Result<i64, String> {
-        if let Some(view) = self.model.workbook.views.get_mut(&self.model.view_id) {
-            return Ok(view.window_width);
-        };
-        Err("View not found".to_string())
-    }
-
-    /// Sets the height of the window
-    pub fn set_window_height(&mut self, window_height: f64) {
-        if let Some(view) = self.model.workbook.views.get_mut(&self.model.view_id) {
-            view.window_height = window_height as i64;
-        };
-    }
-
-    /// Gets the height of the window
-    pub fn get_window_height(&mut self) -> Result<i64, String> {
-        if let Some(view) = self.model.workbook.views.get_mut(&self.model.view_id) {
-            return Ok(view.window_height);
-        };
-        Err("View not found".to_string())
-    }
-
     /// User presses right arrow
     pub fn on_arrow_right(&mut self) -> Result<(), String> {
         let (sheet, window_width) =

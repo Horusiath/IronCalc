@@ -1418,6 +1418,7 @@ impl CollabModel<'_> {
             WorkbookPropKind::Timezone => {
                 WorkbookProperty::Timezone(self.workbook.settings.tz.clone())
             }
+            WorkbookPropKind::Name => WorkbookProperty::Name(self.workbook.name.clone()),
         };
         if prev == property {
             return; // nothing changed
@@ -1444,6 +1445,11 @@ impl CollabModel<'_> {
         self.commit_workbook_property(WorkbookProperty::Locale(locale_id.to_string()));
         self.evaluate();
         Ok(())
+    }
+
+    /// Sets the workbook name.
+    pub fn set_name(&mut self, name: &str) {
+        self.commit_workbook_property(WorkbookProperty::Name(name.to_string()));
     }
 
     /// Sets the workbook timezone.

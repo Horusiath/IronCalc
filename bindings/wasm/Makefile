@@ -31,6 +31,15 @@ all: deps
 deps:
 	pnpm install --frozen-lockfile
 
+# Same as `all`, but builds the collaborative (Stable) model bindings.
+collab: deps
+	wasm-pack build --target web --scope ironcalc --release -- --features collab
+	cp README.pkg.md pkg/README.md
+	pnpm exec tsc types.ts --target esnext --module esnext
+	$(PYTHON) fix_types.py pkg
+	$(PYTHON) fix_package.py pkg
+	rm -f types.js
+
 tests:
 	wasm-pack build --target nodejs && node tests/test.mjs && node tests/test_cf.mjs
 	wasm-pack build --target nodejs --out-dir pkg-xlsx -- --features xlsx && node tests/test_xlsx.mjs
@@ -45,4 +54,4 @@ clean:
 	rm -rf pkg pkg-xlsx
 	rm -f types.js
 
-.PHONY: all deps lint clean tests
+.PHONY: all deps collab lint clean tests

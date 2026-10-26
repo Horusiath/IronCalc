@@ -258,11 +258,6 @@ impl FractionalIndex {
         None
     }
 
-    /// Whether this index has ever seen `key`, either as live or moved element.
-    pub(crate) fn seen(&self, key: &FractionalKey) -> bool {
-        self.resolve(key).is_some()
-    }
-
     /// The stamp of the removal that ended `key`'s chain: `None` while its element is still active,
     /// or when the key is unknown here.
     pub(crate) fn removed_at(&self, key: &FractionalKey) -> Option<Hlc> {
@@ -369,6 +364,32 @@ impl FractionalIndex {
         self.remove_key_at(key, Hlc::now())
     }
 
+    /// [`Self::remove_key_at`] for each of `keys`.
+    pub fn remove_keys_at(&mut self, keys: &[FractionalKey], at: Hlc) {
+        let mut keys: Vec<&FractionalKey> = keys.iter().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let (mut active, mut moved, mut remove) = (Vec::new(), Vec::new(), Vec::new());
+        for key in keys {
+            let removal = Entry::new(key.clone(), at, FractionalKey::NULL);
+            match self.active.binary_search_by_key(&key, |e| &e.key) {
+                Ok(i) if self.active[i].moved.is_empty() => {
+                    if Self::wins((&removal, false), (&self.active[i], true)) {
+                        // key found in active set and our removal wins over it
+                        active.push(i);
+                        moved.push(removal);
+                    }
+                }
+                _ => remove.push(key), // key was moved or removed
+            }
+        }
+        Self::remove_all(&mut self.active, &active);
+        Self::insert_all(&mut self.moved, moved);
+        for key in remove {
+            self.remove_key_at(key, at);
+        }
+    }
+
     /// [`Self::remove_key`] stamping `at` rather than the local clock: the apply path passes the
     /// commit's stamp, so every replica files the same tombstone.
     ///
@@ -470,6 +491,34 @@ impl FractionalIndex {
                 }
             }
         }
+    }
+
+    /// [`Self::insert_key_at`] for each of `keys`. Returns whether any of them put back an element
+    /// this index had already seen (a revive).
+    pub fn insert_keys_at(&mut self, keys: &[FractionalKey], at: Hlc) -> bool {
+        let (mut fresh, mut seen) = (Vec::new(), Vec::new());
+        for key in keys {
+            if let Some(ordinal) = virtual_ordinal(key) {
+                self.watermark = self.watermark.max(ordinal);
+            }
+            if self.locate(key).is_none() {
+                fresh.push(key);
+            } else {
+                seen.push(key);
+            }
+        }
+        fresh.sort_unstable();
+        fresh.dedup();
+        let entries = fresh
+            .into_iter()
+            .map(|key| Entry::new(key.clone(), at, FractionalKey::NULL))
+            .collect();
+        Self::insert_all(&mut self.active, entries);
+        let mut revived = false;
+        for key in seen {
+            revived |= self.insert_key_at(key.clone(), at).is_some();
+        }
+        revived
     }
 
     /// Replays an author-minted move: `source`'s element takes the `dest` position, or keeps what it

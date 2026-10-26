@@ -947,11 +947,8 @@ impl CollabModel<'_> {
                     return Ok(());
                 };
                 let index = &mut self.workbook.worksheets[i].index;
-                for key in keys {
-                    let seen = index.rows.seen(key);
-                    if index.rows.insert_key_at(key.clone(), ts.hlc).is_some() && seen {
-                        self.local.revived = true;
-                    }
+                if index.rows.insert_keys_at(keys, ts.hlc) {
+                    self.local.revived = true;
                 }
             }
             Patch::InsertColumns { sheet, keys } => {
@@ -959,11 +956,8 @@ impl CollabModel<'_> {
                     return Ok(());
                 };
                 let index = &mut self.workbook.worksheets[i].index;
-                for key in keys {
-                    let seen = index.cols.seen(key);
-                    if index.cols.insert_key_at(key.clone(), ts.hlc).is_some() && seen {
-                        self.local.revived = true;
-                    }
+                if index.cols.insert_keys_at(keys, ts.hlc) {
+                    self.local.revived = true;
                 }
             }
             Patch::DeleteRows { sheet, keys, .. } => {
@@ -974,8 +968,8 @@ impl CollabModel<'_> {
                     worksheets, styles, ..
                 } = &mut self.workbook;
                 let sheet = &mut worksheets[i];
+                sheet.index.rows.remove_keys_at(keys, ts.hlc);
                 for key in keys {
-                    sheet.index.rows.remove_key_at(key, ts.hlc);
                     // The delete is one more write per register: it takes what it outranks and
                     // leaves what a newer write already claimed.
                     let registers = &sheet.index.registers;
@@ -1018,8 +1012,8 @@ impl CollabModel<'_> {
                     worksheets, styles, ..
                 } = &mut self.workbook;
                 let sheet = &mut worksheets[i];
+                sheet.index.cols.remove_keys_at(keys, ts.hlc);
                 for key in keys {
-                    sheet.index.cols.remove_key_at(key, ts.hlc);
                     let registers = &sheet.index.registers;
                     // Retain, not `iter_mut`: a row the delete empties has to go with its last cell.
                     sheet.sheet_data.retain(|row_key, row| {
@@ -1547,16 +1541,12 @@ impl CollabModel<'_> {
                 sheet.index.rows = FractionalIndex::decode(rows, suffix)?;
                 sheet.index.cols = FractionalIndex::decode(columns, suffix)?;
             }
-            SheetIndexSeed::Extent { rows, columns } => {
+            SheetIndexSeed::Extent {
+                rows: height,
+                columns: width,
+            } => {
                 // The used extent first: index ordinals are list positions, so an imported sheet needs
                 // the rows and columns before its cells to exist for them to read where the file put them.
-                for i in 1..=*rows {
-                    sheet.index.rows.insert_key_at(virtual_key(i), ts.hlc);
-                }
-                for i in 1..=*columns {
-                    sheet.index.cols.insert_key_at(virtual_key(i), ts.hlc);
-                }
-
                 let mut rows: Vec<&FractionalKey> =
                     content.rows.iter().map(|(key, _)| key).collect();
                 let mut cols: Vec<&FractionalKey> = content
@@ -1582,16 +1572,16 @@ impl CollabModel<'_> {
                     rows.push(row);
                     cols.push(col);
                 }
-                rows.sort();
-                rows.dedup();
-                cols.sort();
-                cols.dedup();
-                for key in rows {
-                    sheet.index.rows.insert_key_at(key.clone(), ts.hlc);
-                }
-                for key in cols {
-                    sheet.index.cols.insert_key_at(key.clone(), ts.hlc);
-                }
+                let rows: Vec<FractionalKey> = (1..=*height)
+                    .map(virtual_key)
+                    .chain(rows.into_iter().cloned())
+                    .collect();
+                let cols: Vec<FractionalKey> = (1..=*width)
+                    .map(virtual_key)
+                    .chain(cols.into_iter().cloned())
+                    .collect();
+                sheet.index.rows.insert_keys_at(&rows, ts.hlc);
+                sheet.index.cols.insert_keys_at(&cols, ts.hlc);
             }
         }
 
@@ -1609,10 +1599,18 @@ impl CollabModel<'_> {
                 .insert(at.clone(), *ts);
             self.write_cell(i, at, Some(value));
         }
+        let mut interned: HashMap<&Style, (i32, Vec<PropKind>)> = HashMap::new();
         for (at, style) in &content.cell_styles {
-            let s = self.intern_style(style);
+            let (s, kinds) = match interned.get(style) {
+                Some(hit) => hit,
+                None => {
+                    let entry = (self.intern_style(style), set_kinds(style).collect());
+                    interned.entry(style).or_insert(entry)
+                }
+            };
+            let s = *s;
             let sheet = &mut self.workbook.worksheets[i];
-            for kind in set_kinds(style) {
+            for &kind in kinds {
                 sheet
                     .index
                     .registers

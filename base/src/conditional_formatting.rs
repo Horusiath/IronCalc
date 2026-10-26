@@ -114,35 +114,42 @@ impl<'a, A: Position> Model<'a, A> {
         self.cf_cache.clear();
         let sheet_count = self.workbook.worksheets.len();
         for sheet_idx in 0..sheet_count {
-            let dim = self.workbook.worksheets[sheet_idx].dimension();
-            let index = self.workbook.worksheets[sheet_idx].index.clone();
-            let mut cfs = self.workbook.worksheets[sheet_idx]
-                .conditional_formatting
-                .clone();
-            // Lower priority number = higher priority; process high-priority first so that
-            // the first writer into cf_cache wins.
-            cfs.sort_by_key(|cf| cf.priority);
-            for cf in cfs {
-                // An unbounded axis resolves to the whole grid; evaluation is dense per
-                // cell, so clamp it to the sheet's used range.
-                let ranges: Vec<(i32, i32, i32, i32)> = cf
-                    .ranges
-                    .iter()
-                    .filter_map(|r| {
-                        let (r1, c1, mut r2, mut c2) = A::resolve_range(r, &index)?;
-                        if r.rows.is_none() {
-                            r2 = r2.min(dim.max_row);
+            // Resolve ranges while borrowing the sheet, so its index is never cloned.
+            let rules: Vec<_> = {
+                let ws = &self.workbook.worksheets[sheet_idx];
+                let dim = ws.dimension();
+                let mut cfs: Vec<_> = ws.conditional_formatting.iter().collect();
+                // Lower priority number = higher priority; process high-priority first so that
+                // the first writer into cf_cache wins.
+                cfs.sort_by_key(|cf| cf.priority);
+                cfs.into_iter()
+                    .filter_map(|cf| {
+                        // An unbounded axis resolves to the whole grid; evaluation is dense per
+                        // cell, so clamp it to the sheet's used range.
+                        let ranges: Vec<(i32, i32, i32, i32)> = cf
+                            .ranges
+                            .iter()
+                            .filter_map(|r| {
+                                let (r1, c1, mut r2, mut c2) = A::resolve_range(r, &ws.index)?;
+                                if r.rows.is_none() {
+                                    r2 = r2.min(dim.max_row);
+                                }
+                                if r.cols.is_none() {
+                                    c2 = c2.min(dim.max_column);
+                                }
+                                Some((r1, c1, r2, c2))
+                            })
+                            .collect();
+                        if ranges.is_empty() {
+                            None
+                        } else {
+                            Some((cf.cf_rule.clone(), ranges))
                         }
-                        if r.cols.is_none() {
-                            c2 = c2.min(dim.max_column);
-                        }
-                        Some((r1, c1, r2, c2))
                     })
-                    .collect();
-                if ranges.is_empty() {
-                    continue;
-                }
-                self.apply_cf_rule(sheet_idx as u32, &cf.cf_rule, &ranges);
+                    .collect()
+            };
+            for (rule, ranges) in rules {
+                self.apply_cf_rule(sheet_idx as u32, &rule, &ranges);
             }
         }
     }

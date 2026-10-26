@@ -134,19 +134,23 @@ impl Position for Stable {
 
     /// A key the index no longer addresses names no position, and is skipped.
     fn stored_cells(sheet: &Worksheet<Stable>) -> impl Iterator<Item = (i32, i32, Cow<'_, Cell>)> {
-        let mut cells = Vec::new();
-        for (row_key, row_data) in &sheet.sheet_data {
-            let Some(row) = Self::row_ordinal(&sheet.index, row_key) else {
-                continue;
-            };
-            for (column_key, cell) in row_data {
-                if let Some(column) = Self::col_ordinal(&sheet.index, column_key) {
-                    cells.push((row, column, Cow::Borrowed(cell)));
-                }
-            }
-        }
-        cells.sort_unstable_by_key(|(row, column, _)| (*row, *column));
-        cells.into_iter()
+        let index = &sheet.index;
+        index.rows.view().enumerate().flat_map(move |(i, row_key)| {
+            let mut cells: Vec<(i32, &Cell)> = sheet
+                .sheet_data
+                .get(row_key)
+                .into_iter()
+                .flatten()
+                .filter_map(|(column_key, cell)| {
+                    Some((Self::col_ordinal(index, column_key)?, cell))
+                })
+                .collect();
+            cells.sort_unstable_by_key(|(column, _)| *column);
+            let row = i as i32 + 1;
+            cells
+                .into_iter()
+                .map(move |(column, cell)| (row, column, Cow::Borrowed(cell)))
+        })
     }
 
     /// A key the index no longer addresses names no position, and is skipped.

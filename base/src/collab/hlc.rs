@@ -12,20 +12,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// - lower 16bits: sequence num
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[repr(transparent)]
-pub struct Hlc(u64);
+pub struct Hlc([u32; 2]); // use 2 * u32 to keep the Timestamp struct 4-byte aligned
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Hlc {
     #[inline(always)]
     pub const fn new(value: u64) -> Self {
-        Hlc(value)
+        Hlc([(value >> 32) as u32, value as u32])
     }
 
     /// The raw payload: wall clock in the upper 48 bits, sequence in the lower 16.
     #[inline(always)]
     pub const fn get(self) -> u64 {
-        self.0
+        (self.0[0] as u64) << 32 | self.0[1] as u64
     }
 
     /// Send rule: the next stamp this replica mints, strictly above every stamp it has seen.
@@ -40,7 +40,7 @@ impl Hlc {
                 .compare_exchange(latest, next, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return Hlc(next);
+                return Hlc::new(next);
             }
         }
     }
@@ -48,7 +48,7 @@ impl Hlc {
     /// Receive rule: registers a stamp minted elsewhere as a potential high watermark for the local
     /// clock, and returns it unchanged.
     pub fn sync(timestamp: Self) -> Self {
-        COUNTER.fetch_max(timestamp.0, Ordering::SeqCst);
+        COUNTER.fetch_max(timestamp.get(), Ordering::SeqCst);
         timestamp
     }
 }
@@ -67,7 +67,7 @@ impl<'de> Deserialize<'de> for Hlc {
             }
 
             fn visit_u64<E>(self, value: u64) -> Result<Hlc, E> {
-                let t = Hlc(value);
+                let t = Hlc::new(value);
                 // synchronize the timestamp with our current knowledge
                 Hlc::sync(t);
                 Ok(t)
@@ -83,7 +83,7 @@ impl Serialize for Hlc {
     where
         S: Serializer,
     {
-        serializer.serialize_u64(self.0)
+        serializer.serialize_u64(self.get())
     }
 }
 
@@ -106,7 +106,7 @@ impl Buffer for HlcEncoder {
 impl Encoder<Hlc> for HlcEncoder {
     #[inline]
     fn encode(&mut self, t: &Hlc) {
-        Encoder::<u64>::encode(&mut self.0, &t.0);
+        Encoder::<u64>::encode(&mut self.0, &t.get());
     }
 }
 
@@ -127,7 +127,7 @@ impl<'a> Decoder<'a, Hlc> for HlcDecoder<'a> {
     #[inline]
     fn decode(&mut self) -> Hlc {
         // synchronize the timestamp with our current knowledge
-        Hlc::sync(Hlc(self.0.decode()))
+        Hlc::sync(Hlc::new(self.0.decode()))
     }
 }
 

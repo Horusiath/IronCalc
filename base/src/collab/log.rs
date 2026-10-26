@@ -49,11 +49,15 @@ pub type SessionId = u32;
 /// [`Hlc`] carries no node component, so it is the only tiebreak there is.
 ///
 /// Field order is significant: the derived [`Ord`] compares `hlc` first.
+#[repr(C, packed(4))]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Encode, Decode)]
 pub struct Timestamp {
     pub hlc: Hlc,
     pub session: SessionId,
 }
+
+// One per cell register, so the layout matters: `Hlc` is two `u32` halves to keep this at 12 bytes.
+const _: () = assert!(std::mem::size_of::<Timestamp>() == 12);
 
 impl Timestamp {
     pub fn new(hlc: Hlc, session: SessionId) -> Self {

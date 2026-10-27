@@ -14,6 +14,17 @@ pub struct WorksheetDimension {
     pub max_column: i32,
 }
 
+impl WorksheetDimension {
+    pub fn new(min_row: i32, max_row: i32, min_col: i32, max_col: i32) -> Self {
+        WorksheetDimension {
+            min_row,
+            max_row,
+            min_column: min_col,
+            max_column: max_col,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum NavigationDirection {
     Left,

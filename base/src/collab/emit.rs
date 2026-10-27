@@ -3607,6 +3607,7 @@ mod test {
     use crate::collab::log::{SessionId, Snapshot};
     use crate::collab::patch::invert_patches;
     use crate::types::MergedCell;
+    use crate::worksheet::WorksheetDimension;
     use crate::{Model, UserModel};
 
     /// Replays what a framework would transport: each flushed [`Commit`] delivered as it stands.
@@ -4303,6 +4304,72 @@ mod test {
         assert_eq!(b.get_formatted_cell_value(0, 2, 1), Ok("keep".to_string()));
         assert_eq!(b.get_formatted_cell_value(0, 2, 2), Ok("999".to_string()));
         assert_eq!(b.workbook, a.workbook);
+    }
+
+    #[test]
+    fn write_after_undo_of_concurrent_row_delete_survives() {
+        let mut a = CollabModel::new(1);
+        a.new_sheet();
+        a.set_user_input(0, 1, 1, "top".to_string()).unwrap(); // A: A1=top
+        a.set_user_input(0, 2, 1, "keep".to_string()).unwrap(); // A: A2=keep
+        let setup = a.flush();
+        let mut b = CollabModel::new(2);
+        let mut c = CollabModel::new(3);
+        deliver(&mut b, 1, &setup);
+        deliver(&mut c, 1, &setup);
+
+        a.delete_rows(0, 2, 1).unwrap(); // delete row 2 -> delete A2
+        let deleted = a.flush();
+        let undo: Vec<Patch> = deleted
+            .iter()
+            .rev()
+            .flat_map(|commit| invert_patches(&commit.patches))
+            .collect();
+        a.commit_local(undo);
+        let undone = a.flush(); // undo delete row 2 -> restore A2=keep
+
+        // Program order stamps both above the undo: B2 was empty at the delete, A2 is restored by it.
+        b.set_user_input(0, 2, 2, "late".to_string()).unwrap(); // B: B2=late
+        b.set_user_input(0, 2, 1, "overwrite".to_string()).unwrap(); // B: A2=overwrite
+        let late = b.flush();
+
+        // deleted: A's delete row 2 at t1
+        // undone: A's undo delete row 2 + restore A2=keep at t2
+        // late: B's [B2=late, A2=overwrite] at t3
+        deliver(&mut a, 2, &late);
+        deliver(&mut b, 1, &deleted);
+        deliver(&mut b, 1, &undone);
+        deliver(&mut c, 1, &deleted);
+
+        // for C deliver B's patch in-between 2 patches from A
+        deliver(&mut c, 2, &late);
+
+        // undo delete row 2 didn't arrive yet: A2 and B2 should be removed
+        assert_eq!(c.get_formatted_cell_value(0, 2, 2), Ok("".to_string()));
+        assert_eq!(c.get_formatted_cell_value(0, 2, 1), Ok("".to_string()));
+        let expected = WorksheetDimension::new(1, 1, 1, 1);
+        assert_eq!(c.workbook.worksheets[0].dimension(), expected);
+
+        // deliver A's undo delete row 2 to C
+        deliver(&mut c, 1, &undone);
+
+        let expected = WorksheetDimension::new(1, 2, 1, 2);
+        for m in [&mut a, &mut b, &mut c] {
+            m.evaluate();
+            // final state on all peers:
+            // A1=top at t1 (made by A)
+            assert_eq!(m.get_formatted_cell_value(0, 1, 1), Ok("top".to_string()));
+            // A2=overwrite at t3 (made by B)
+            assert_eq!(
+                m.get_formatted_cell_value(0, 2, 1),
+                Ok("overwrite".to_string())
+            );
+            // B2=late at t3 (made by B)
+            assert_eq!(m.get_formatted_cell_value(0, 2, 2), Ok("late".to_string()));
+            assert_eq!(m.workbook.worksheets[0].dimension(), expected);
+        }
+        assert_eq!(b.workbook, a.workbook);
+        assert_eq!(c.workbook, a.workbook);
     }
 
     #[test]

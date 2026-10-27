@@ -4373,6 +4373,41 @@ mod test {
     }
 
     #[test]
+    fn write_older_than_row_delete_stays_dead_after_undo() {
+        let mut a = CollabModel::new(1);
+        a.new_sheet();
+        a.set_user_input(0, 2, 1, "keep".to_string()).unwrap(); // A: A2=keep (t1)
+        let setup = a.flush();
+        let mut b = CollabModel::new(2);
+        deliver(&mut b, 1, &setup);
+
+        b.set_user_input(0, 2, 2, "early".to_string()).unwrap(); // B: B2=early (t2)
+        let early = b.flush();
+
+        a.delete_rows(0, 2, 1).unwrap(); // delete row 2 -> delete A2 (t3)
+        let deleted = a.flush();
+        let undo: Vec<Patch> = deleted
+            .iter()
+            .rev()
+            .flat_map(|commit| invert_patches(&commit.patches))
+            .collect();
+        a.commit_local(undo);
+        let undone = a.flush(); // undo delete row 2 -> restore A2=keep (t4)
+
+        // A sees the write only after the undo revived the row; B sees it before the delete.
+        deliver(&mut a, 2, &early); // B's B2=early (t2)
+        deliver(&mut b, 1, &deleted); // A's delete row 2 (t3)
+        deliver(&mut b, 1, &undone); // A's undo delete row 2 (t4)
+
+        for m in [&mut a, &mut b] {
+            m.evaluate();
+            assert_eq!(m.get_formatted_cell_value(0, 2, 1), Ok("keep".to_string()));
+            assert_eq!(m.get_formatted_cell_value(0, 2, 2), Ok("".to_string()));
+        }
+        assert_eq!(b.workbook, a.workbook);
+    }
+
+    #[test]
     fn undo_keeps_what_a_peer_wrote_concurrently() {
         let mut a = UserModel::<Stable>::from_model(CollabModel::new(1));
         let mut b = UserModel::<Stable>::from_model(CollabModel::new(2));

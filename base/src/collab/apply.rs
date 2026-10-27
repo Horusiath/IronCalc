@@ -269,42 +269,23 @@ fn intern_formula(formulas: &mut Vec<StableFormula>, formula: &StableFormula) ->
 fn cell_style(sheet: &Worksheet<Stable>, at: &StableCellAddress) -> i32 {
     sheet
         .sheet_data
-        .get(&at.0)
-        .and_then(|row| row.get(&at.1))
+        .cell(&at.0, &at.1)
         .map(|cell| cell.get_style())
         .unwrap_or(0)
 }
 
-fn put_cell(sheet: &mut Worksheet<Stable>, at: &StableCellAddress, cell: Cell) {
-    sheet
-        .sheet_data
-        .entry(at.0.clone())
-        .or_default()
-        .insert(at.1.clone(), cell);
-}
-
 fn store_style(sheet: &mut Worksheet<Stable>, at: &StableCellAddress, s: i32) {
-    let cell = sheet.sheet_data.get(&at.0).and_then(|r| r.get(&at.1));
+    let cell = sheet.sheet_data.cell(&at.0, &at.1);
     if s == 0 && matches!(cell, None | Some(Cell::EmptyCell { .. })) {
-        remove_cell(sheet, at);
+        sheet.sheet_data.remove_cell(&at.0, &at.1);
         return;
     }
-    match sheet
-        .sheet_data
-        .get_mut(&at.0)
-        .and_then(|r| r.get_mut(&at.1))
-    {
+    match sheet.sheet_data.cell_mut(&at.0, &at.1) {
         Some(cell) => cell.set_style(s),
-        None => put_cell(sheet, at, Cell::EmptyCell { s }),
-    }
-}
-
-fn remove_cell(sheet: &mut Worksheet<Stable>, at: &StableCellAddress) {
-    if let Some(row) = sheet.sheet_data.get_mut(&at.0) {
-        row.remove(&at.1);
-        // An emptied map must go: a replica whose write lost never filed the row at all.
-        if row.is_empty() {
-            sheet.sheet_data.remove(&at.0);
+        None => {
+            sheet
+                .sheet_data
+                .insert_cell(at.0.clone(), at.1.clone(), Cell::EmptyCell { s });
         }
     }
 }
@@ -973,14 +954,9 @@ impl CollabModel<'_> {
                     // The delete is one more write per register: it takes what it outranks and
                     // leaves what a newer write already claimed.
                     let registers = &sheet.index.registers;
-                    if let Some(row) = sheet.sheet_data.get_mut(key) {
-                        row.retain(|col, cell| {
-                            keep_cell(registers, styles, &(key.clone(), col.clone()), ts.hlc, cell)
-                        });
-                        if row.is_empty() {
-                            sheet.sheet_data.remove(key);
-                        }
-                    }
+                    sheet.sheet_data.retain_row(key, |col, cell| {
+                        keep_cell(registers, styles, &(key.clone(), col.clone()), ts.hlc, cell)
+                    });
                     let kept = |kind| {
                         registers
                             .rows
@@ -1015,15 +991,14 @@ impl CollabModel<'_> {
                 sheet.index.cols.remove_keys_at(keys, ts.hlc);
                 for key in keys {
                     let registers = &sheet.index.registers;
-                    // Retain, not `iter_mut`: a row the delete empties has to go with its last cell.
-                    sheet.sheet_data.retain(|row_key, row| {
-                        let address = (row_key.clone(), key.clone());
-                        if let Some(cell) = row.get_mut(key) {
-                            if !keep_cell(registers, styles, &address, ts.hlc, cell) {
-                                row.remove(key);
-                            }
-                        }
-                        !row.is_empty()
+                    sheet.sheet_data.retain_col(key, |row_key, cell| {
+                        keep_cell(
+                            registers,
+                            styles,
+                            &(row_key.clone(), key.clone()),
+                            ts.hlc,
+                            cell,
+                        )
                     });
                     // Spans are regions, not sets of columns: what they cover resolves against the
                     // index, which just shrank.
@@ -1455,7 +1430,9 @@ impl CollabModel<'_> {
     /// on the cell survives — it is a register of its own.
     fn write_cell(&mut self, i: usize, at: &StableCellAddress, value: Option<&CellInput>) {
         let Some(value) = value else {
-            remove_cell(&mut self.workbook.worksheets[i], at);
+            self.workbook.worksheets[i]
+                .sheet_data
+                .remove_cell(&at.0, &at.1);
             return;
         };
         // Interning first: it needs the workbook, the cell needs the sheet.
@@ -1466,7 +1443,9 @@ impl CollabModel<'_> {
         let sheet = &mut self.workbook.worksheets[i];
         let style = cell_style(sheet, at);
         let cell = build_cell(sheet, value, style, shared_string);
-        put_cell(sheet, at, cell);
+        sheet
+            .sheet_data
+            .insert_cell(at.0.clone(), at.1.clone(), cell);
         // use [CollabSession::unresolved] to remember the names of object that couldn't be mapped
         // to their IDs
         if let CellInput::Formula(formula)
@@ -1489,21 +1468,19 @@ impl CollabModel<'_> {
     fn index_unresolved(&mut self) {
         self.local.unresolved.clear();
         for sheet in &self.workbook.worksheets {
-            for (row_key, row_data) in &sheet.sheet_data {
-                for (column_key, cell) in row_data {
-                    let Some(f) = cell.get_formula() else {
-                        continue;
-                    };
-                    let Some(formula) = sheet.shared_formulas.get(f as usize) else {
-                        continue;
-                    };
-                    for name in formula.text_names() {
-                        self.local
-                            .unresolved
-                            .entry(name.to_uppercase())
-                            .or_default()
-                            .insert((sheet.sheet_id, (row_key.clone(), column_key.clone())));
-                    }
+            for (row_key, column_key, cell) in sheet.sheet_data.cells() {
+                let Some(f) = cell.get_formula() else {
+                    continue;
+                };
+                let Some(formula) = sheet.shared_formulas.get(f as usize) else {
+                    continue;
+                };
+                for name in formula.text_names() {
+                    self.local
+                        .unresolved
+                        .entry(name.to_uppercase())
+                        .or_default()
+                        .insert((sheet.sheet_id, (row_key.clone(), column_key.clone())));
                 }
             }
             for (at, link) in &sheet.links {
@@ -1617,13 +1594,13 @@ impl CollabModel<'_> {
                     .cell_styles
                     .insert((at.clone(), kind), *ts);
             }
-            match sheet
-                .sheet_data
-                .get_mut(&at.0)
-                .and_then(|r| r.get_mut(&at.1))
-            {
+            match sheet.sheet_data.cell_mut(&at.0, &at.1) {
                 Some(cell) => cell.set_style(s),
-                None => put_cell(sheet, at, Cell::EmptyCell { s }),
+                None => {
+                    sheet
+                        .sheet_data
+                        .insert_cell(at.0.clone(), at.1.clone(), Cell::EmptyCell { s });
+                }
             }
         }
 
@@ -1871,7 +1848,7 @@ mod test {
 
     fn cell(model: &CollabModel<'_>, row: &FractionalKey, col: &FractionalKey) -> Option<Cell> {
         let sheet = model.workbook.worksheets.first()?;
-        sheet.sheet_data.get(row)?.get(col).cloned()
+        sheet.sheet_data.cell(row, col).cloned()
     }
 
     /// A sheet with three rows and three columns, as commit 1.
@@ -2256,15 +2233,11 @@ mod test {
         assert_eq!(Stable::row_ordinal(&sheet.index, &rows[0]), Some(2));
         assert_eq!(Stable::row_ordinal(&sheet.index, &rows[2]), Some(1));
         // ...and its cells never moved: they are filed under identity, not position.
-        assert!(sheet.sheet_data.contains_key(&rows[0]));
-        assert_eq!(sheet.sheet_data[&rows[0]].len(), 1);
+        assert_eq!(sheet.sheet_data.row_cells(&rows[0]).count(), 1);
         // The deleted row and column took their cells with them.
         assert_eq!(Stable::row_ordinal(&sheet.index, &rows[1]), None);
-        assert!(!sheet.sheet_data.contains_key(&rows[1]));
-        assert!(sheet
-            .sheet_data
-            .values()
-            .all(|row| !row.contains_key(&cols[1])));
+        assert!(!sheet.sheet_data.rows().any(|(row, _)| row == &rows[1]));
+        assert_eq!(sheet.sheet_data.col_cells(&cols[1]).count(), 0);
         assert_eq!(sheet.index.rows.len(), 2);
         assert_eq!(sheet.index.cols.len(), 1);
 

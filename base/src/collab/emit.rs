@@ -399,7 +399,7 @@ impl CollabModel<'_> {
     /// value.
     pub(crate) fn cell_input(&self, i: usize, at: &StableCellAddress) -> Option<CellInput> {
         let sheet = &self.workbook.worksheets[i];
-        let cell = sheet.sheet_data.get(&at.0)?.get(&at.1)?;
+        let cell = sheet.sheet_data.cell(&at.0, &at.1)?;
         match cell {
             Cell::BooleanCell { v, .. } => Some(CellInput::Boolean(*v)),
             Cell::NumberCell { v, .. } => Some(CellInput::Number(*v)),
@@ -581,10 +581,7 @@ impl CollabModel<'_> {
     }
 
     pub(crate) fn cell_style_at(&self, i: usize, at: &StableCellAddress) -> Option<Style> {
-        let cell = self.workbook.worksheets[i]
-            .sheet_data
-            .get(&at.0)?
-            .get(&at.1)?;
+        let cell = self.workbook.worksheets[i].sheet_data.cell(&at.0, &at.1)?;
         self.workbook.styles.get_style(cell.get_style()).ok()
     }
 
@@ -1345,12 +1342,12 @@ impl CollabModel<'_> {
         // Only the cells that exist: a whole-column range covers the sheet, not the grid.
         let sheet = &self.workbook.worksheets[i];
         let mut cells: Vec<StableCellAddress> = Vec::new();
-        for (row_key, row_data) in &sheet.sheet_data {
+        for (row_key, row_cells) in sheet.sheet_data.rows() {
             match Stable::row_ordinal(&sheet.index, row_key) {
                 Some(row) if (area.row..area.row + area.height).contains(&row) => {}
                 _ => continue,
             }
-            for column_key in row_data.keys() {
+            for (column_key, _) in row_cells {
                 match Stable::col_ordinal(&sheet.index, column_key) {
                     Some(column) if (area.column..area.column + area.width).contains(&column) => {}
                     _ => continue,
@@ -1442,11 +1439,9 @@ impl CollabModel<'_> {
                 // The cells the column actually holds, plus the ones sitting on a styled row.
                 let sheet = &self.workbook.worksheets[i];
                 let mut rows = styled_rows.clone();
-                for (row_key, row_data) in &sheet.sheet_data {
-                    if row_data.contains_key(&col_key) {
-                        if let Some(row) = Stable::row_ordinal(&sheet.index, row_key) {
-                            rows.push(row);
-                        }
+                for (row_key, _) in sheet.sheet_data.col_cells(&col_key) {
+                    if let Some(row) = Stable::row_ordinal(&sheet.index, row_key) {
+                        rows.push(row);
                     }
                 }
                 // `sheet_data` is a hash map: sort, so the commit does not depend on its iteration.
@@ -1485,11 +1480,9 @@ impl CollabModel<'_> {
                 // The cells the row actually holds, plus the ones sitting on a styled column.
                 let sheet = &self.workbook.worksheets[i];
                 let mut columns = styled_columns.clone();
-                if let Some(row_data) = sheet.sheet_data.get(&row_key) {
-                    for col_key in row_data.keys() {
-                        if let Some(column) = Stable::col_ordinal(&sheet.index, col_key) {
-                            columns.push(column);
-                        }
+                for (col_key, _) in sheet.sheet_data.row_cells(&row_key) {
+                    if let Some(column) = Stable::col_ordinal(&sheet.index, col_key) {
+                        columns.push(column);
                     }
                 }
                 columns.sort();
@@ -2381,14 +2374,9 @@ impl CollabModel<'_> {
                 };
                 let (cell_values, cell_styles) = self.cell_snapshots(
                     i,
-                    sheet
-                        .sheet_data
-                        .get(key)
-                        .into_iter()
-                        .flatten()
-                        .map(|(col, cell)| {
-                            ((key.clone(), col.clone()), col.clone(), cell.get_style())
-                        }),
+                    sheet.sheet_data.row_cells(key).map(|(col, cell)| {
+                        ((key.clone(), col.clone()), col.clone(), cell.get_style())
+                    }),
                 );
                 let props = stamped(
                     &registers.rows,
@@ -2427,9 +2415,8 @@ impl CollabModel<'_> {
                 };
                 let (cell_values, cell_styles) = self.cell_snapshots(
                     i,
-                    sheet.sheet_data.iter().filter_map(|(row, cells)| {
-                        let cell = cells.get(key)?;
-                        Some(((row.clone(), key.clone()), row.clone(), cell.get_style()))
+                    sheet.sheet_data.col_cells(key).map(|(row, cell)| {
+                        ((row.clone(), key.clone()), row.clone(), cell.get_style())
                     }),
                 );
                 let span = (key.clone(), key.clone());
@@ -2498,17 +2485,15 @@ impl CollabModel<'_> {
         let sheet = &self.workbook.worksheets[i];
         let mut cell_values = Vec::new();
         let mut cell_styles = Vec::new();
-        for (row, cells) in &sheet.sheet_data {
-            for (col, cell) in cells {
-                let at = (row.clone(), col.clone());
-                if let Some(input) = self.cell_input(i, &at) {
-                    cell_values.push((at.clone(), input));
-                }
-                // Only a cell holding a style of its own: 0 is the table's default entry.
-                if cell.get_style() != 0 {
-                    if let Ok(style) = self.workbook.styles.get_style(cell.get_style()) {
-                        cell_styles.push((at, style));
-                    }
+        for (row, col, cell) in sheet.sheet_data.cells() {
+            let at = (row.clone(), col.clone());
+            if let Some(input) = self.cell_input(i, &at) {
+                cell_values.push((at.clone(), input));
+            }
+            // Only a cell holding a style of its own: 0 is the table's default entry.
+            if cell.get_style() != 0 {
+                if let Ok(style) = self.workbook.styles.get_style(cell.get_style()) {
+                    cell_styles.push((at, style));
                 }
             }
         }
@@ -5337,8 +5322,8 @@ mod test {
         let cells = |s: &crate::types::Worksheet<Stable>| {
             let mut cells: Vec<_> = s
                 .sheet_data
-                .iter()
-                .flat_map(|(r, row)| row.keys().map(move |c| (r.clone(), c.clone())))
+                .cells()
+                .map(|(r, c, _)| (r.clone(), c.clone()))
                 .collect();
             cells.sort();
             cells
@@ -6274,7 +6259,7 @@ mod test {
         assert_eq!(a.get_formatted_cell_value(1, 1, 1), Ok("10".to_string()));
         // A resurrected row would re-enter the index right after the snapshot's, so the ordinal the
         // edit was authored at says nothing: what proves it gone is the sheet still being one row.
-        let rows = |m: &CollabModel<'_>| m.workbook.worksheets[1].sheet_data.len();
+        let rows = |m: &CollabModel<'_>| m.workbook.worksheets[1].sheet_data.rows().count(); //TODO: optimise row counting
         assert_eq!((rows(&a), rows(&b)), (1, 1));
         assert_eq!(b.workbook, a.workbook);
 

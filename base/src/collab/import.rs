@@ -469,8 +469,8 @@ impl CollabModel<'_> {
         // interned, so the indices the cells carry are the ones this table hands out.
         let mut shared_formulas: Vec<String> = Vec::new();
         let mut sheet_data = SheetData::<Ordinal>::default();
-        for (r, cells) in &ws.sheet_data {
-            let Some(r) = row(r) else { continue };
+        for (row_key, cells) in ws.sheet_data.rows() {
+            let Some(r) = row(row_key) else { continue };
             for (c, cell) in cells {
                 let Some(c) = col(c) else { continue };
                 let cell = match cell.get_formula() {

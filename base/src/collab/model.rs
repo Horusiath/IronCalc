@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use crate::collab::bind::Host;
+use crate::collab::cell_map::CellMap;
 use crate::collab::formula::StableFormula;
 use crate::collab::fractional_index::{FractionalIndex, FractionalKey, SESSION_SUFFIX_LEN};
 use crate::collab::log::{Commit, Lww, SessionId, Timestamp};
@@ -46,7 +47,7 @@ impl Sealed for Stable {}
 impl Position for Stable {
     type Key = FractionalKey;
     type SheetIndex = SheetIndexes;
-    type SheetData = HashMap<FractionalKey, HashMap<FractionalKey, Cell>>;
+    type SheetData = CellMap;
     type MergedCell = StableRange;
     type WorkbookMeta = WorkbookMeta;
     type Local = CollabSession;
@@ -107,13 +108,13 @@ impl Position for Stable {
     fn stored_cell(sheet: &Worksheet<Stable>, row: i32, column: i32) -> Option<Cow<'_, Cell>> {
         let r = Self::row_at(&sheet.index, row)?;
         let c = Self::col_at(&sheet.index, column)?;
-        sheet.sheet_data.get(&r)?.get(&c).map(Cow::Borrowed)
+        sheet.sheet_data.cell(&r, &c).map(Cow::Borrowed)
     }
 
     fn stored_cell_mut(sheet: &mut Worksheet<Stable>, row: i32, column: i32) -> Option<&mut Cell> {
         let r = Self::row_at(&sheet.index, row)?;
         let c = Self::col_at(&sheet.index, column)?;
-        sheet.sheet_data.get_mut(&r)?.get_mut(&c)
+        sheet.sheet_data.cell_mut(&r, &c)
     }
 
     fn store_cell(
@@ -128,7 +129,7 @@ impl Position for Stable {
         ) else {
             return Err("Incorrect row or column".to_string());
         };
-        sheet.sheet_data.entry(r).or_default().insert(c, cell);
+        sheet.sheet_data.insert_cell(r, c, cell);
         Ok(())
     }
 
@@ -138,9 +139,7 @@ impl Position for Stable {
         index.rows.view().enumerate().flat_map(move |(i, row_key)| {
             let mut cells: Vec<(i32, &Cell)> = sheet
                 .sheet_data
-                .get(row_key)
-                .into_iter()
-                .flatten()
+                .row_cells(row_key)
                 .filter_map(|(column_key, cell)| {
                     Some((Self::col_ordinal(index, column_key)?, cell))
                 })
@@ -158,12 +157,10 @@ impl Position for Stable {
         let Some(row_key) = Self::row_at(&sheet.index, row) else {
             return Vec::new();
         };
-        let Some(row_data) = sheet.sheet_data.get(&row_key) else {
-            return Vec::new();
-        };
-        let mut columns: Vec<i32> = row_data
-            .keys()
-            .filter_map(|key| Self::col_ordinal(&sheet.index, key))
+        let mut columns: Vec<i32> = sheet
+            .sheet_data
+            .row_cells(&row_key)
+            .filter_map(|(key, _)| Self::col_ordinal(&sheet.index, key))
             .collect();
         columns.sort_unstable();
         columns
@@ -685,7 +682,8 @@ mod test {
         let mut sheet_data = crate::types::SheetData::<Stable>::default();
         for (r, row_key) in rows.iter().enumerate() {
             for (c, col_key) in cols.iter().enumerate() {
-                sheet_data.entry(row_key.clone()).or_default().insert(
+                sheet_data.insert_cell(
+                    row_key.clone(),
                     col_key.clone(),
                     Cell::NumberCell {
                         v: (10 * r + c) as f64,
@@ -758,7 +756,7 @@ mod test {
         let cell_at = |ws: &Worksheet<Stable>, row: i32, col: i32| {
             let r = Stable::row_at(&ws.index, row)?;
             let c = Stable::col_at(&ws.index, col)?;
-            ws.sheet_data.get(&r)?.get(&c).cloned()
+            ws.sheet_data.cell(&r, &c).cloned()
         };
         assert_eq!(cell_at(&ws, 2, 3), Some(Cell::NumberCell { v: 12.0, s: 0 }));
 

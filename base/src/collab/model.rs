@@ -323,7 +323,7 @@ pub struct SheetIndexes {
 /// addressing.
 ///
 /// An entry outlives its subject: deleting a row keeps its cells' guards, so a concurrent write to
-/// one of them loses to the delete instead of resurrecting the row.
+/// one of them older than the delete loses to it. A newer one brings the row back.
 #[derive(Clone, Debug, Default, PartialEq, Encode, Decode)]
 pub struct SheetRegisters {
     pub cell_values: HashMap<StableCellAddress, Timestamp>,

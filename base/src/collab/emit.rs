@@ -2350,8 +2350,20 @@ impl CollabModel<'_> {
         index.plan_insert(at as usize - 1, count as usize)
     }
 
-    /// Everything the rows `keys` name is about to lose, so that undo can put it back — including
-    /// the stamp each register holds, which is what the restore replays at.
+    /// The position keys of the `count` elements from ordinal `first`, and their identities. A
+    /// delete names the positions, so that its undo puts a moved element back where it was.
+    fn positions_and_identities(
+        index: &FractionalIndex,
+        first: i32,
+        count: i32,
+    ) -> (Vec<FractionalKey>, Vec<FractionalKey>) {
+        (first - 1..first - 1 + count)
+            .filter_map(|i| index.get(i as usize))
+            .map(|e| (e.key.clone(), e.identity().clone()))
+            .unzip()
+    }
+
+    /// Everything the rows `keys` (identities) name is about to lose, so that undo can put it back.
     fn row_snapshots(&self, i: usize, keys: &[FractionalKey]) -> Vec<RowSnapshot> {
         let sheet = &self.workbook.worksheets[i];
         let registers = &sheet.index.registers;
@@ -2634,14 +2646,12 @@ impl CollabModel<'_> {
         if !(1..=LAST_ROW).contains(&row) {
             return Err(format!("Row number '{row}' is not valid."));
         }
-        let index = &self.workbook.worksheets[i].index;
-        let keys: Vec<FractionalKey> = (row..row + row_count)
-            .filter_map(|r| Stable::row_at(index, r))
-            .collect();
+        let (keys, ids) =
+            Self::positions_and_identities(&self.workbook.worksheets[i].index.rows, row, row_count);
         if keys.is_empty() {
             return Ok(());
         }
-        let prev = self.row_snapshots(i, &keys);
+        let prev = self.row_snapshots(i, &ids);
         let patches = vec![Patch::DeleteRows {
             sheet: id,
             keys,
@@ -2694,14 +2704,15 @@ impl CollabModel<'_> {
         if !(1..=LAST_COLUMN).contains(&column) {
             return Err(format!("Column number '{column}' is not valid."));
         }
-        let index = &self.workbook.worksheets[i].index;
-        let keys: Vec<FractionalKey> = (column..column + column_count)
-            .filter_map(|c| Stable::col_at(index, c))
-            .collect();
+        let (keys, ids) = Self::positions_and_identities(
+            &self.workbook.worksheets[i].index.cols,
+            column,
+            column_count,
+        );
         if keys.is_empty() {
             return Ok(());
         }
-        let prev = self.column_snapshots(i, &keys);
+        let prev = self.column_snapshots(i, &ids);
         let patches = vec![Patch::DeleteColumns {
             sheet: id,
             keys,
@@ -4259,8 +4270,6 @@ mod test {
         assert_eq!(b_ws.index, a_ws.index);
     }
 
-    /// Undoing a delete replays the restores at the stamps they were captured with, so a
-    /// concurrent newer edit to a restored cell outlives the undo.
     #[test]
     fn undo_delete_concurrent() {
         let mut a = CollabModel::new(1);
@@ -4287,25 +4296,31 @@ mod test {
 
         let undone = a.flush();
         deliver(&mut b, 1, &deletes);
-        // The surviving edit is dead but invisible until the undo puts its row back.
-        assert_eq!(b.get_formatted_cell_value(0, 2, 2), Ok("".to_string()));
+        // B's newer edit keeps row 2 live, holding only that edit until the undo.
+        assert_eq!(b.get_formatted_cell_value(0, 2, 2), Ok("999".to_string()));
+        assert_eq!(b.get_formatted_cell_value(0, 2, 1), Ok("".to_string()));
         deliver(&mut b, 1, &undone);
         deliver(&mut a, 2, &b.flush());
         a.evaluate();
         b.evaluate();
 
-        // The uncontested cell came back; the contested one kept B's newer edit.
-        assert_eq!(a.get_formatted_cell_value(0, 2, 1), Ok("keep".to_string()));
-        assert_eq!(a.get_formatted_cell_value(0, 2, 2), Ok("999".to_string()));
+        // Both cells came back: the undo is stamped after B's edit, so it wins the contested one.
+        for m in [&a, &b] {
+            assert_eq!(m.get_formatted_cell_value(0, 2, 1), Ok("keep".to_string()));
+            assert_eq!(
+                m.get_formatted_cell_value(0, 2, 2),
+                Ok("edit-me".to_string())
+            );
+        }
         assert_eq!(
             b.workbook.worksheets[0].index.registers,
             a.workbook.worksheets[0].index.registers
         );
-        assert_eq!(b.get_formatted_cell_value(0, 2, 1), Ok("keep".to_string()));
-        assert_eq!(b.get_formatted_cell_value(0, 2, 2), Ok("999".to_string()));
         assert_eq!(b.workbook, a.workbook);
     }
 
+    /// Writes newer than a row delete bring the row back wherever they land, before or after the
+    /// delete's undo, and outrank the undo's older restore.
     #[test]
     fn write_after_undo_of_concurrent_row_delete_survives() {
         let mut a = CollabModel::new(1);
@@ -4344,10 +4359,14 @@ mod test {
         // for C deliver B's patch in-between 2 patches from A
         deliver(&mut c, 2, &late);
 
-        // undo delete row 2 didn't arrive yet: A2 and B2 should be removed
-        assert_eq!(c.get_formatted_cell_value(0, 2, 2), Ok("".to_string()));
-        assert_eq!(c.get_formatted_cell_value(0, 2, 1), Ok("".to_string()));
-        let expected = WorksheetDimension::new(1, 1, 1, 1);
+        // The undo has not arrived yet, but B's writes are newer than the delete: row 2 is back,
+        // holding only them.
+        assert_eq!(c.get_formatted_cell_value(0, 2, 2), Ok("late".to_string()));
+        assert_eq!(
+            c.get_formatted_cell_value(0, 2, 1),
+            Ok("overwrite".to_string())
+        );
+        let expected = WorksheetDimension::new(1, 2, 1, 2);
         assert_eq!(c.workbook.worksheets[0].dimension(), expected);
 
         // deliver A's undo delete row 2 to C
@@ -4404,7 +4423,399 @@ mod test {
             assert_eq!(m.get_formatted_cell_value(0, 2, 1), Ok("keep".to_string()));
             assert_eq!(m.get_formatted_cell_value(0, 2, 2), Ok("".to_string()));
         }
-        assert_eq!(b.workbook, a.workbook);
+        // shared_strings fills in arrival order: tracked separately.
+        assert_eq!(b.workbook.worksheets, a.workbook.worksheets);
+    }
+
+    /// Three replicas of one sheet, set up from `cells` written by A.
+    fn replicas(cells: &[(i32, i32, &str)]) -> [CollabModel<'static>; 3] {
+        let mut a = CollabModel::new(1);
+        a.new_sheet();
+        for &(row, column, text) in cells {
+            a.set_user_input(0, row, column, text.to_string()).unwrap();
+        }
+        let setup = a.flush();
+        let (mut b, mut c) = (CollabModel::new(2), CollabModel::new(3));
+        deliver(&mut b, 1, &setup);
+        deliver(&mut c, 1, &setup);
+        [a, b, c]
+    }
+
+    /// A's `deleted` and B's newer `edit`, delivered in both orders, and to C delete first.
+    fn deliver_delete_and_edit(
+        [a, b, c]: &mut [CollabModel<'static>; 3],
+        deleted: &[Commit],
+        edit: &[Commit],
+    ) {
+        deliver(a, 2, edit);
+        deliver(b, 1, deleted);
+        deliver(c, 1, deleted);
+        deliver(c, 2, edit);
+    }
+
+    /// Every replica shows `expected` (row, column, text) and holds the same sheets.
+    fn assert_converged(models: &mut [CollabModel<'static>; 3], expected: &[(i32, i32, &str)]) {
+        for m in models.iter_mut() {
+            m.evaluate();
+            for &(row, column, text) in expected {
+                assert_eq!(
+                    m.get_formatted_cell_value(0, row, column),
+                    Ok(text.to_string()),
+                    "({row}, {column})"
+                );
+            }
+        }
+        let [a, b, c] = models;
+        assert_eq!(
+            b.workbook.worksheets[0].dimension(),
+            a.workbook.worksheets[0].dimension()
+        );
+        assert_eq!(
+            c.workbook.worksheets[0].dimension(),
+            a.workbook.worksheets[0].dimension()
+        );
+        // shared_strings fills in arrival order: tracked separately.
+        assert_eq!(b.workbook.worksheets, a.workbook.worksheets);
+        assert_eq!(c.workbook.worksheets, a.workbook.worksheets);
+    }
+
+    /// An edit newer than a row delete brings the row back, holding only that edit.
+    #[test]
+    fn edit_newer_than_row_delete_revives_row() {
+        let mut models = replicas(&[(1, 1, "top"), (2, 1, "keep"), (3, 1, "below")]);
+        let [a, b, _] = &mut models;
+        a.delete_rows(0, 2, 1).unwrap();
+        let deleted = a.flush();
+        b.set_user_input(0, 2, 2, "new".to_string()).unwrap(); // stamped after the delete
+        let edit = b.flush();
+
+        deliver_delete_and_edit(&mut models, &deleted, &edit);
+        assert_converged(
+            &mut models,
+            &[(1, 1, "top"), (2, 1, ""), (2, 2, "new"), (3, 1, "below")],
+        );
+        let expected = WorksheetDimension::new(1, 3, 1, 2);
+        assert_eq!(models[0].workbook.worksheets[0].dimension(), expected);
+        // The shown row is not in the snapshot's index: decoding rebuilds it from the content.
+        let restored = CollabModel::decode(&models[0].encode(), 4).unwrap();
+        assert_eq!(restored.workbook.worksheets, models[0].workbook.worksheets);
+    }
+
+    /// An edit newer than a column delete brings the column back, holding only that edit.
+    #[test]
+    fn edit_newer_than_column_delete_revives_column() {
+        let mut models = replicas(&[(1, 1, "left"), (1, 2, "keep"), (1, 3, "right")]);
+        let [a, b, _] = &mut models;
+        a.delete_columns(0, 2, 1).unwrap();
+        let deleted = a.flush();
+        b.set_user_input(0, 2, 2, "new".to_string()).unwrap(); // stamped after the delete
+        let edit = b.flush();
+
+        deliver_delete_and_edit(&mut models, &deleted, &edit);
+        assert_converged(
+            &mut models,
+            &[(1, 1, "left"), (1, 2, ""), (2, 2, "new"), (1, 3, "right")],
+        );
+        let expected = WorksheetDimension::new(1, 2, 1, 3);
+        assert_eq!(models[0].workbook.worksheets[0].dimension(), expected);
+        let restored = CollabModel::decode(&models[0].encode(), 4).unwrap();
+        assert_eq!(restored.workbook.worksheets, models[0].workbook.worksheets);
+    }
+
+    /// A column delete that takes the only newer cell of a revived row leaves the row back; where
+    /// the column delete came first, that cell was dead but still revived it.
+    #[test]
+    fn column_delete_taking_last_newer_cell_keeps_revived_row() {
+        // C1 materializes column B everywhere, so the column delete names a key every replica knows.
+        let mut models = replicas(&[(1, 1, "top"), (2, 1, "keep"), (3, 1, "below"), (1, 3, "c1")]);
+        let [a, b, c] = &mut models;
+        a.delete_rows(0, 2, 1).unwrap();
+        let row_deleted = a.flush();
+        b.set_user_input(0, 2, 2, "new".to_string()).unwrap(); // after the row delete
+        let edit = b.flush();
+        a.delete_columns(0, 2, 1).unwrap(); // after the edit
+        let col_deleted = a.flush();
+
+        deliver(a, 2, &edit);
+        deliver(b, 1, &row_deleted);
+        deliver(b, 1, &col_deleted);
+        deliver(c, 1, &row_deleted);
+        deliver(c, 2, &edit);
+        assert_eq!(c.get_formatted_cell_value(0, 2, 2), Ok("new".to_string()));
+        deliver(c, 1, &col_deleted);
+
+        assert_converged(
+            &mut models,
+            &[
+                (1, 1, "top"),
+                (1, 2, "c1"),
+                (2, 1, ""),
+                (2, 2, ""),
+                (3, 1, "below"),
+            ],
+        );
+        let expected = WorksheetDimension::new(1, 3, 1, 2);
+        assert_eq!(models[0].workbook.worksheets[0].dimension(), expected);
+    }
+
+    /// An edit newer than both deletes of its row and its column brings both back.
+    #[test]
+    fn edit_newer_than_row_and_column_delete_revives_both() {
+        let mut models = replicas(&[
+            (1, 1, "a1"),
+            (1, 2, "b1"),
+            (2, 1, "a2"),
+            (2, 2, "b2"),
+            (3, 3, "c3"),
+        ]);
+        let [a, b, _] = &mut models;
+        a.delete_rows(0, 2, 1).unwrap();
+        a.delete_columns(0, 2, 1).unwrap();
+        let deleted = a.flush();
+        b.set_user_input(0, 2, 2, "new".to_string()).unwrap(); // stamped after both deletes
+        let edit = b.flush();
+
+        deliver_delete_and_edit(&mut models, &deleted, &edit);
+        assert_converged(
+            &mut models,
+            &[
+                (1, 1, "a1"),
+                (1, 2, ""),
+                (2, 1, ""),
+                (2, 2, "new"),
+                (3, 3, "c3"),
+            ],
+        );
+        let expected = WorksheetDimension::new(1, 3, 1, 3);
+        assert_eq!(models[0].workbook.worksheets[0].dimension(), expected);
+    }
+
+    /// A clear newer than a row delete brings the row back, empty.
+    #[test]
+    fn clear_newer_than_row_delete_revives_row_empty() {
+        let mut models = replicas(&[(1, 1, "top"), (2, 1, "keep"), (3, 1, "below")]);
+        let [a, b, _] = &mut models;
+        a.delete_rows(0, 2, 1).unwrap();
+        let deleted = a.flush();
+        b.cell_clear_contents(0, 2, 1).unwrap(); // stamped after the delete
+        let clear = b.flush();
+
+        deliver_delete_and_edit(&mut models, &deleted, &clear);
+        assert_converged(&mut models, &[(1, 1, "top"), (2, 1, ""), (3, 1, "below")]);
+        let expected = WorksheetDimension::new(1, 3, 1, 1);
+        assert_eq!(models[0].workbook.worksheets[0].dimension(), expected);
+        assert_eq!(models[0].workbook.worksheets[0].index.rows.len(), 3);
+    }
+
+    /// Clearing the only newer cell of a revived row leaves the row back.
+    #[test]
+    fn clearing_the_last_newer_cell_keeps_revived_row() {
+        let mut models = replicas(&[(1, 1, "top"), (2, 1, "keep"), (3, 1, "below")]);
+        let [a, b, c] = &mut models;
+        a.delete_rows(0, 2, 1).unwrap();
+        let deleted = a.flush();
+        b.set_user_input(0, 2, 2, "new".to_string()).unwrap(); // stamped after the delete
+        let edit = b.flush();
+        b.cell_clear_contents(0, 2, 2).unwrap();
+        let clear = b.flush();
+
+        deliver(a, 2, &edit);
+        deliver(a, 2, &clear);
+        deliver(b, 1, &deleted);
+        deliver(c, 1, &deleted);
+        deliver(c, 2, &edit);
+        assert_eq!(c.get_formatted_cell_value(0, 2, 2), Ok("new".to_string()));
+        assert_eq!(c.get_formatted_cell_value(0, 3, 1), Ok("below".to_string()));
+        deliver(c, 2, &clear);
+
+        assert_converged(
+            &mut models,
+            &[(1, 1, "top"), (2, 1, ""), (2, 2, ""), (3, 1, "below")],
+        );
+        let expected = WorksheetDimension::new(1, 3, 1, 1);
+        assert_eq!(models[0].workbook.worksheets[0].dimension(), expected);
+    }
+
+    /// The inverse of `commits`, newest first: what an undo commits.
+    fn inverse(commits: &[Commit]) -> Vec<Patch> {
+        (commits.iter().rev())
+            .flat_map(|commit| invert_patches(&commit.patches))
+            .collect()
+    }
+
+    /// Undoing the delete of a moved row puts it back where it was deleted, with its cells; redo
+    /// deletes it again.
+    #[test]
+    fn undo_of_moved_row_delete_restores_it_in_place() {
+        let mut models = replicas(&[(1, 1, "r1"), (2, 1, "r2"), (3, 1, "r3"), (4, 1, "r4")]);
+        let [a, b, c] = &mut models;
+        a.move_rows_action(0, 2, 1, 2).unwrap(); // r2 to row 4
+        a.delete_rows(0, 4, 1).unwrap();
+        let deleted = a.flush();
+        a.commit_local(inverse(&deleted[1..]));
+        let undone = a.flush();
+        for m in [b, c] {
+            deliver(m, 1, &deleted);
+            deliver(m, 1, &undone);
+        }
+        let restored = [(1, 1, "r1"), (2, 1, "r3"), (3, 1, "r4"), (4, 1, "r2")];
+        assert_converged(&mut models, &restored);
+
+        let [a, b, c] = &mut models;
+        a.commit_local(inverse(&undone));
+        let redone = a.flush();
+        deliver(b, 1, &redone);
+        deliver(c, 1, &redone);
+        let deleted = [(1, 1, "r1"), (2, 1, "r3"), (3, 1, "r4"), (4, 1, "")];
+        assert_converged(&mut models, &deleted);
+        assert_eq!(models[0].workbook.worksheets[0].index.rows.len(), 3);
+    }
+
+    /// [`undo_of_moved_row_delete_restores_it_in_place`] for a column.
+    #[test]
+    fn undo_of_moved_column_delete_restores_it_in_place() {
+        let mut models = replicas(&[(1, 1, "c1"), (1, 2, "c2"), (1, 3, "c3"), (1, 4, "c4")]);
+        let [a, b, c] = &mut models;
+        a.move_columns_action(0, 2, 1, 2).unwrap(); // c2 to column 4
+        a.delete_columns(0, 4, 1).unwrap();
+        let deleted = a.flush();
+        a.commit_local(inverse(&deleted[1..]));
+        let undone = a.flush();
+        for m in [b, c] {
+            deliver(m, 1, &deleted);
+            deliver(m, 1, &undone);
+        }
+        let restored = [(1, 1, "c1"), (1, 2, "c3"), (1, 3, "c4"), (1, 4, "c2")];
+        assert_converged(&mut models, &restored);
+
+        let [a, b, c] = &mut models;
+        a.commit_local(inverse(&undone));
+        let redone = a.flush();
+        deliver(b, 1, &redone);
+        deliver(c, 1, &redone);
+        let deleted = [(1, 1, "c1"), (1, 2, "c3"), (1, 3, "c4"), (1, 4, "")];
+        assert_converged(&mut models, &deleted);
+        assert_eq!(models[0].workbook.worksheets[0].index.cols.len(), 3);
+    }
+
+    /// The undo of a moved row's delete racing B's newer move of that row: B's move holds the
+    /// position, the undo restores the cells, in every delivery order.
+    #[test]
+    fn undo_of_moved_row_delete_races_a_concurrent_move() {
+        let mut models = replicas(&[(1, 1, "r1"), (2, 1, "r2"), (3, 1, "r3"), (4, 1, "r4")]);
+        let [a, b, c] = &mut models;
+        a.move_rows_action(0, 2, 1, 2).unwrap(); // r2 to row 4
+        a.delete_rows(0, 4, 1).unwrap();
+        let deleted = a.flush();
+        a.commit_local(inverse(&deleted[1..]));
+        let undone = a.flush();
+        b.move_rows_action(0, 2, 1, -1).unwrap(); // r2 to row 1, stamped after the undo
+        let moved = b.flush();
+
+        deliver(a, 2, &moved);
+        deliver(b, 1, &deleted);
+        deliver(b, 1, &undone);
+        deliver(c, 1, &deleted);
+        deliver(c, 2, &moved);
+        deliver(c, 1, &undone);
+        assert_converged(
+            &mut models,
+            &[(1, 1, "r2"), (2, 1, "r1"), (3, 1, "r3"), (4, 1, "r4")],
+        );
+    }
+
+    /// [`undo_of_moved_row_delete_races_a_concurrent_move`] for a column.
+    #[test]
+    fn undo_of_moved_column_delete_races_a_concurrent_move() {
+        let mut models = replicas(&[(1, 1, "c1"), (1, 2, "c2"), (1, 3, "c3"), (1, 4, "c4")]);
+        let [a, b, c] = &mut models;
+        a.move_columns_action(0, 2, 1, 2).unwrap(); // c2 to column 4
+        a.delete_columns(0, 4, 1).unwrap();
+        let deleted = a.flush();
+        a.commit_local(inverse(&deleted[1..]));
+        let undone = a.flush();
+        b.move_columns_action(0, 2, 1, -1).unwrap(); // c2 to column 1, stamped after the undo
+        let moved = b.flush();
+
+        deliver(a, 2, &moved);
+        deliver(b, 1, &deleted);
+        deliver(b, 1, &undone);
+        deliver(c, 1, &deleted);
+        deliver(c, 2, &moved);
+        deliver(c, 1, &undone);
+        assert_converged(
+            &mut models,
+            &[(1, 1, "c2"), (1, 2, "c1"), (1, 3, "c3"), (1, 4, "c4")],
+        );
+    }
+
+    /// B's move stamped between A's delete and its undo: the undo is newest, so the row is back
+    /// where it was deleted, with its cells, whether B's move arrives before or after the undo.
+    #[test]
+    fn undo_of_moved_row_delete_outranks_an_older_concurrent_move() {
+        let mut models = replicas(&[(1, 1, "r1"), (2, 1, "r2"), (3, 1, "r3"), (4, 1, "r4")]);
+        let [a, b, c] = &mut models;
+        a.move_rows_action(0, 2, 1, 2).unwrap(); // r2 to row 4
+        a.delete_rows(0, 4, 1).unwrap();
+        let deleted = a.flush();
+        b.move_rows_action(0, 2, 1, -1).unwrap(); // r2 to row 1, after the delete
+        let moved = b.flush();
+        a.commit_local(inverse(&deleted[1..])); // after B's move
+        let undone = a.flush();
+
+        deliver(a, 2, &moved);
+        deliver(b, 1, &deleted);
+        deliver(b, 1, &undone);
+        deliver(c, 1, &deleted);
+        deliver(c, 2, &moved);
+        deliver(c, 1, &undone);
+        assert_converged(
+            &mut models,
+            &[(1, 1, "r1"), (2, 1, "r3"), (3, 1, "r4"), (4, 1, "r2")],
+        );
+    }
+
+    /// [`undo_of_moved_row_delete_outranks_an_older_concurrent_move`] for a column.
+    #[test]
+    fn undo_of_moved_column_delete_outranks_an_older_concurrent_move() {
+        let mut models = replicas(&[(1, 1, "c1"), (1, 2, "c2"), (1, 3, "c3"), (1, 4, "c4")]);
+        let [a, b, c] = &mut models;
+        a.move_columns_action(0, 2, 1, 2).unwrap(); // c2 to column 4
+        a.delete_columns(0, 4, 1).unwrap();
+        let deleted = a.flush();
+        b.move_columns_action(0, 2, 1, -1).unwrap(); // c2 to column 1, after the delete
+        let moved = b.flush();
+        a.commit_local(inverse(&deleted[1..])); // after B's move
+        let undone = a.flush();
+
+        deliver(a, 2, &moved);
+        deliver(b, 1, &deleted);
+        deliver(b, 1, &undone);
+        deliver(c, 1, &deleted);
+        deliver(c, 2, &moved);
+        deliver(c, 1, &undone);
+        assert_converged(
+            &mut models,
+            &[(1, 1, "c1"), (1, 2, "c3"), (1, 3, "c4"), (1, 4, "c2")],
+        );
+    }
+
+    /// A row property newer than a row delete is stored, but does not bring the row back.
+    #[test]
+    fn row_property_newer_than_row_delete_keeps_row_deleted() {
+        let mut models = replicas(&[(1, 1, "top"), (2, 1, "keep"), (3, 1, "below")]);
+        let [a, b, _] = &mut models;
+        a.delete_rows(0, 2, 1).unwrap();
+        let deleted = a.flush();
+        b.set_row_height(0, 2, 40.0).unwrap(); // stamped after the delete
+        let height = b.flush();
+
+        deliver_delete_and_edit(&mut models, &deleted, &height);
+        assert_converged(&mut models, &[(1, 1, "top"), (2, 1, "below"), (3, 1, "")]);
+        for m in &models {
+            assert_eq!(m.workbook.worksheets[0].index.rows.len(), 2);
+            assert_eq!(m.get_row_height(0, 2), m.get_row_height(0, 1));
+        }
     }
 
     #[test]

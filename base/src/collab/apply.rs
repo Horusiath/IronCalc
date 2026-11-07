@@ -6,8 +6,8 @@
 //! and redelivery rewrites the same values.
 //!
 //! Applying is **total**: a patch naming a sheet, row or rule that is not here is a no-op, never an
-//! error — a commit is never rejected. Guards outlive their subject, so a late write cannot
-//! resurrect a deleted one.
+//! error — a commit is never rejected. Guards outlive their subject, so a write older than a delete
+//! cannot resurrect what it deleted.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use crate::cf_types::{CfRule, ConditionalFormatting};
 use crate::collab::bind::Host;
 use crate::collab::codec::CodecError;
 use crate::collab::formula::StableFormula;
-use crate::collab::fractional_index::{virtual_key, FractionalIndex, FractionalKey};
+use crate::collab::fractional_index::{virtual_key, Entry, FractionalIndex, FractionalKey};
 use crate::collab::hlc::Hlc;
 use crate::collab::log::{Commit, Consumer, Lww, SessionId, Snapshot, Timestamp};
 use crate::collab::model::{
@@ -34,6 +34,7 @@ use crate::constants::{
     COLUMN_WIDTH_FACTOR, DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT, LAST_COLUMN, LAST_ROW,
     ROW_HEIGHT_FACTOR,
 };
+use crate::evaluation::KeyBuild;
 use crate::expressions::parser::stringify::to_english_string;
 use crate::expressions::parser::{static_analysis::run_static_analysis_on_node, Node};
 use crate::expressions::token;
@@ -98,6 +99,9 @@ impl Snapshot for CollabModel<'static> {
         }
         for (index, text) in model.workbook.shared_strings.iter().enumerate() {
             model.shared_strings.insert(text.clone(), index);
+        }
+        for sheet in &mut model.workbook.worksheets {
+            rebuild_touched(&mut sheet.index);
         }
         model.index_unresolved();
         model.resync_parsed();
@@ -372,13 +376,48 @@ fn keep_cell(
     newer_value || any_style
 }
 
+/// Whether a write stamped `ts` to `at` is dead: its row or column was removed at or after it,
+/// revived since or not.
 pub(crate) fn cell_deleted(index: &SheetIndexes, at: &StableCellAddress, ts: Hlc) -> bool {
-    match index.rows.removed_at(&at.0) {
-        Some(tombstone) if tombstone >= ts => true,
-        _ => match index.cols.removed_at(&at.1) {
-            Some(tombstone) => tombstone >= ts,
-            None => false,
-        },
+    let removed = |e: Option<&Entry>| e.is_some_and(|e| ts <= e.removed_at);
+    removed(index.rows.entry_by_id(&at.0)) || removed(index.cols.entry_by_id(&at.1))
+}
+
+/// The identities `keys` name, the unknown ones left out.
+fn identities(index: &FractionalIndex, keys: &[FractionalKey]) -> Vec<FractionalKey> {
+    keys.iter()
+        .filter_map(|k| index.entry_by_key(k).map(|e| e.key.clone()))
+        .collect()
+}
+
+fn touch_cell(index: &mut SheetIndexes, at: &StableCellAddress, ts: Hlc) -> (bool, bool) {
+    let (row, row_removed) = index.rows.touch(&at.0, ts);
+    let (col, col_removed) = index.cols.touch(&at.1, ts);
+    (row || col, ts <= row_removed || ts <= col_removed)
+}
+
+fn rebuild_touched(index: &mut SheetIndexes) {
+    let registers = &index.registers;
+    let (row_floor, col_floor) = (index.rows.moved_floor(), index.cols.moved_floor());
+    let mut rows: HashMap<_, _, KeyBuild> = HashMap::default();
+    let mut cols: HashMap<_, _, KeyBuild> = HashMap::default();
+    let cells = (registers.cell_values.iter())
+        .chain((registers.cell_styles.iter()).map(|((at, _), ts)| (at, ts)));
+    for ((row, col), ts) in cells {
+        if ts.hlc > row_floor {
+            let stamp = rows.entry(row).or_insert(ts.hlc);
+            *stamp = (*stamp).max(ts.hlc);
+        }
+        if ts.hlc > col_floor {
+            let stamp = cols.entry(col).or_insert(ts.hlc);
+            *stamp = (*stamp).max(ts.hlc);
+        }
+    }
+    for (row, ts) in rows {
+        index.rows.touch(row, ts);
+    }
+    for (col, ts) in cols {
+        index.cols.touch(col, ts);
     }
 }
 
@@ -871,10 +910,10 @@ impl CollabModel<'_> {
                 };
                 let ts = at_ts.as_ref().unwrap_or(ts);
                 let index = &mut self.workbook.worksheets[i].index;
-                // The guard is written either way; only the content is dead under a tombstone.
-                if !wins(&mut index.registers.cell_values, at, ts)
-                    || cell_deleted(index, at, ts.hlc)
-                {
+                let (revived, dead) = touch_cell(index, at, ts.hlc);
+                self.local.revived |= revived;
+                // The guard is written either way; only the content is dead under a removal.
+                if !wins(&mut index.registers.cell_values, at, ts) || dead {
                     return Ok(());
                 }
                 self.write_cell(i, at, value.as_ref());
@@ -891,13 +930,15 @@ impl CollabModel<'_> {
                 };
                 let ts = at_ts.as_ref().unwrap_or(ts);
                 let index = &mut self.workbook.worksheets[i].index;
+                let (revived, dead) = touch_cell(index, at, ts.hlc);
+                self.local.revived |= revived;
                 let won = winning(
                     &mut index.registers.cell_styles,
                     |k| (at.clone(), k),
                     props,
                     ts,
                 );
-                if won.is_empty() || cell_deleted(index, at, ts.hlc) {
+                if won.is_empty() || dead {
                     return Ok(());
                 }
                 let reference = won.iter().find_map(|p| match p {
@@ -950,7 +991,12 @@ impl CollabModel<'_> {
                 } = &mut self.workbook;
                 let sheet = &mut worksheets[i];
                 sheet.index.rows.remove_keys_at(keys, ts.hlc);
-                for key in keys {
+                // Keys name positions; content is filed by identity.
+                let ids = identities(&sheet.index.rows, keys);
+                self.local.revived |= ids
+                    .iter()
+                    .any(|k| sheet.index.rows.position_of(k).is_some());
+                for key in &ids {
                     // The delete is one more write per register: it takes what it outranks and
                     // leaves what a newer write already claimed.
                     let registers = &sheet.index.registers;
@@ -989,7 +1035,11 @@ impl CollabModel<'_> {
                 } = &mut self.workbook;
                 let sheet = &mut worksheets[i];
                 sheet.index.cols.remove_keys_at(keys, ts.hlc);
-                for key in keys {
+                let ids = identities(&sheet.index.cols, keys);
+                self.local.revived |= ids
+                    .iter()
+                    .any(|k| sheet.index.cols.position_of(k).is_some());
+                for key in &ids {
                     let registers = &sheet.index.registers;
                     sheet.sheet_data.retain_col(key, |row_key, cell| {
                         keep_cell(
@@ -1034,12 +1084,8 @@ impl CollabModel<'_> {
                 };
                 let ts = at_ts.as_ref().unwrap_or(ts);
                 let index = &mut self.workbook.worksheets[i].index;
-                // is row tombstone higher than patch timestamp?
-                let row_deleted = if let Some(t) = index.rows.removed_at(row) {
-                    t >= ts.hlc
-                } else {
-                    false
-                };
+                let row_deleted =
+                    (index.rows.entry_by_id(row)).is_some_and(|e| ts.hlc <= e.removed_at);
                 let won = winning(&mut index.registers.rows, |k| (row.clone(), k), props, ts);
                 if row_deleted || won.is_empty() {
                     return Ok(());
@@ -1669,6 +1715,7 @@ impl CollabModel<'_> {
             insert_cf(sheet, key.clone(), cf);
         }
         rank_cf(&mut self.workbook.worksheets[i]);
+        rebuild_touched(&mut self.workbook.worksheets[i].index);
 
         // sometimes we couldn't resolve location of internal link (it doesn't exist yet), so we
         // need to remember it

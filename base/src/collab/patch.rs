@@ -102,8 +102,8 @@ pub fn decode_patches(bytes: &[u8]) -> Result<Vec<Patch>, DynError> {
 ///   snapshot, so only the one an `AddSheet` inverted into puts its sheet back,
 /// - anything whose `prev` came off the wire, where it decodes as the default.
 ///
-/// Content restores replay at the stamp they were captured with, via the `ts` field, so a
-/// concurrent newer edit to a restored cell survives the undo.
+/// A delete's cell and row restores apply at the undo's own stamp: at the captured one they would
+/// be dead under the delete they undo.
 /// The keys of an insert its author minted, which are the ones its inverse may delete.
 fn inserted_by_a_session(keys: &[FractionalKey]) -> Vec<FractionalKey> {
     keys.iter()
@@ -326,35 +326,37 @@ pub fn invert_patches(patches: &[Patch]) -> Vec<Patch> {
                     sheet: *sheet,
                     keys: keys.clone(),
                 });
+                // Restores take the undo's stamp: at their captured one they would be older than the
+                // delete they undo, so dead.
                 for snap in prev {
-                    for (props, at) in &snap.props {
+                    for (props, _) in &snap.props {
                         out.push(Patch::SetRowProperty {
                             sheet: *sheet,
                             row: snap.key.clone(),
                             props: props.clone(),
-                            ts: Some(*at),
+                            ts: None,
                             prev: Vec::new(),
                         });
                     }
                 }
                 for snap in prev {
-                    for (col, input, ts) in &snap.cell_values {
+                    for (col, input, _) in &snap.cell_values {
                         out.push(Patch::SetCellValue {
                             sheet: *sheet,
                             at: (snap.key.clone(), col.clone()),
                             value: Some(input.clone()),
-                            ts: Some(*ts),
+                            ts: None,
                             prev: Box::new(None),
                         });
                     }
                 }
                 for snap in prev {
-                    for (col, props, ts) in &snap.cell_styles {
+                    for (col, props, _) in &snap.cell_styles {
                         out.push(Patch::SetCellStyle {
                             sheet: *sheet,
                             at: (snap.key.clone(), col.clone()),
                             props: props.clone(),
-                            ts: Some(*ts),
+                            ts: None,
                             prev: Vec::new(),
                         });
                     }
@@ -381,23 +383,23 @@ pub fn invert_patches(patches: &[Patch]) -> Vec<Patch> {
                     }
                 }
                 for snap in prev {
-                    for (row, input, ts) in &snap.cell_values {
+                    for (row, input, _) in &snap.cell_values {
                         out.push(Patch::SetCellValue {
                             sheet: *sheet,
                             at: (row.clone(), snap.key.clone()),
                             value: Some(input.clone()),
-                            ts: Some(*ts),
+                            ts: None,
                             prev: Box::new(None),
                         });
                     }
                 }
                 for snap in prev {
-                    for (row, props, ts) in &snap.cell_styles {
+                    for (row, props, _) in &snap.cell_styles {
                         out.push(Patch::SetCellStyle {
                             sheet: *sheet,
                             at: (row.clone(), snap.key.clone()),
                             props: props.clone(),
-                            ts: Some(*ts),
+                            ts: None,
                             prev: Vec::new(),
                         });
                     }
@@ -1344,7 +1346,7 @@ impl Default for ColState {
 }
 
 /// Everything a [`Patch::DeleteRows`] removed, so that undo can put it back. Local-only undo data.
-/// Each entry carries the stamp of the write it captured, so the restore can replay at that stamp.
+/// Each entry carries the stamp of the write it captured.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowSnapshot {
     pub key: FractionalKey,

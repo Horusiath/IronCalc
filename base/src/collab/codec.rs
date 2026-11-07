@@ -2,8 +2,8 @@
 //! [`FractionalIndex`](crate::collab::fractional_index::FractionalIndex).
 //!
 //! An index holds one [`Entry`] per row, column, sheet and conditional-formatting rule, and the
-//! whole thing is serialized on every snapshot. Entry by entry, each one is two keys and an
-//! [`Hlc`], and a general-purpose coder can only compress what it happens to see side by side —
+//! whole thing is serialized on every snapshot. Entry by entry, each one is two keys and two
+//! [`Hlc`]s, and a general-purpose coder can only compress what it happens to see side by side —
 //! fields of unrelated shape.
 //!
 //! Written *column by column*, the same data is almost entirely redundant, and the redundancy is a
@@ -13,7 +13,8 @@
 //!   ([`CreateKeys`](crate::collab::fractional_index::CreateKeys) is driven by a single replica),
 //! * a bulk run walks its positions by a fixed stride, so consecutive positions are one addition
 //!   apart,
-//! * one operation stamps its whole batch with one `modified_at`,
+//! * one operation stamps its whole batch with one `moved_at`,
+//! * most entries were never removed, so their `removed_at` is zero,
 //! * most entries were never moved, so their `moved` field is [`FractionalKey::NULL`].
 //!
 //! Measured against `bitcode::serialize` over the same `Vec<Entry>`, for keys from a single
@@ -21,27 +22,28 @@
 //!
 //! ```text
 //! entries   columnar   bitcode derive
-//!      10       23 B            91 B
-//!     100       23 B           754 B
-//!   1_000       28 B         7_393 B
-//!  10_000       28 B        73_768 B
+//!      10       29 B            99 B
+//!     100       29 B           784 B
+//!   1_000       35 B         7_647 B
+//!  10_000       35 B        76_272 B
 //! ```
 //!
 //! The run marker is why the last two rows are the same size: a run costs the same whether it covers
-//! a thousand entries or ten thousand. In the *worst* case — every position, session and timestamp
-//! distinct, every entry moved — a thousand entries cost 15.0 bytes each here against 16.3 through
-//! the derive, so the layout does not lose on incompressible data either.
+//! a thousand entries or ten thousand. In the *worst* case — every position, session and both
+//! stamps distinct, every entry moved — a thousand entries cost 29.6 bytes each here against 29.4
+//! through the derive, so the layout does not lose much on incompressible data either.
 //!
 //! # Layout
 //!
-//! One column group per field of [`Entry`], in field order:
+//! One column group per encoded field of [`Entry`] (`touched_at` is derived, and not encoded):
 //!
 //! ```text
-//! table := count:uvarint ++ if count > 0 { key ++ modified_at ++ moved }
+//! table := count:uvarint ++ if count > 0 { key ++ moved_at ++ removed_at ++ moved }
 //!
-//! key         := key_positions ++ sessions
-//! modified_at := one absolute value, then deltas
-//! moved       := moved_positions ++ sessions
+//! key        := key_positions ++ sessions
+//! moved_at   := stamps
+//! removed_at := stamps
+//! moved      := moved_positions ++ sessions
 //! ```
 //!
 //! A key is a position and a session suffix, and each half gets its own sub-column because each
@@ -63,10 +65,10 @@
 //!
 //! sessions        := session:[u8; SESSION_SUFFIX_LEN] ++ run:uvarint
 //!
-//! modified_at     := slot 0: value:ivarint, absolute
+//! stamps          := slot 0: value:ivarint, absolute
 //!                    slot i: delta:ivarint, over the raw `Hlc` payloads
-//!                      delta == 0 -> run:uvarint, entries reusing modified_at[i-1]
-//!                      delta != 0 -> modified_at[i] = modified_at[i-1] + delta
+//!                      delta == 0 -> run:uvarint, entries reusing stamp[i-1]
+//!                      delta != 0 -> stamp[i] = stamp[i-1] + delta
 //! ```
 //!
 //! Three details of that are load-bearing:
@@ -78,7 +80,7 @@
 //!   **2** whenever the gap has room, deliberately, so that a later insert between two run keys
 //!   stays inline — an implied `+1` would miss the bulk-insert path entirely. An explicit delta also
 //!   covers `delta == 0`, which is two sessions minting at one position.
-//! * Slot 0 of `modified_at` is unconditionally absolute and has no marker semantics. Real clock
+//! * Slot 0 of a stamp column is unconditionally absolute and has no marker semantics. Real clock
 //!   values are never `0`, but that is an invariant of the producer, and this decoder reads a peer's
 //!   bytes; exempting the one slot that has nothing to repeat removes the reliance for free.
 //! * A decoded column is folded into the local clock ([`Hlc::sync`]): a stamp read off a snapshot or
@@ -122,7 +124,7 @@ const RUN_MARKER: u64 = MARKER;
 /// A `0` code in a `moved` position column: the next `run` entries carry [`FractionalKey::NULL`].
 const NULL_MARKER: u64 = MARKER;
 
-/// A `0` delta in the `modified_at` column: the next `run` entries reuse the previous timestamp.
+/// A `0` delta in a stamp column: the next `run` entries reuse the previous timestamp.
 const REPEAT_MARKER: i64 = MARKER as i64;
 
 /// Why a payload could not be encoded or decoded.
@@ -241,7 +243,8 @@ pub fn encode_entries(entries: &[Entry], out: &mut Vec<u8>) -> Result<(), CodecE
         return Ok(());
     }
     write_key_column(out, entries);
-    write_modified_at_column(out, entries)?;
+    write_stamp_column(out, entries, |e| e.moved_at)?;
+    write_stamp_column(out, entries, |e| e.removed_at)?;
     write_moved_column(out, entries);
     Ok(())
 }
@@ -255,21 +258,26 @@ pub fn decode_entries(input: &mut &[u8]) -> Result<Vec<Entry>, CodecError> {
     }
 
     let keys = read_key_column(input, count)?;
-    let modified_at = read_modified_at_column(input, count)?;
+    let moved_at = read_stamp_column(input, count)?;
+    let removed_at = read_stamp_column(input, count)?;
     let moved = read_moved_column(input, count)?;
     // Every reader loops until its column has accounted for exactly `count` entries, so the zip
     // below cannot truncate. Asserted rather than assumed, because a reader that came back short
     // would silently produce a smaller index instead of failing.
-    debug_assert!(keys.len() == count && modified_at.len() == count && moved.len() == count);
+    debug_assert!(keys.len() == count && moved_at.len() == count && moved.len() == count);
+    debug_assert!(removed_at.len() == count);
 
     let entries: Vec<Entry> = keys
         .into_iter()
-        .zip(modified_at)
+        .zip(moved_at)
+        .zip(removed_at)
         .zip(moved)
-        .map(|((key, modified_at), moved)| Entry {
+        .map(|(((key, moved_at), removed_at), moved)| Entry {
             key,
-            modified_at,
             moved,
+            moved_at,
+            removed_at,
+            touched_at: Hlc::new(0),
         })
         .collect();
     check_strictly_increasing(&entries)?;
@@ -382,42 +390,42 @@ fn literal_cost(position_len: usize, run: u64) -> usize {
     run as usize * (uvarint_len(position_len as u64 + 1) + position_len)
 }
 
-// ---------------------------------------------------------------------------------------------
-// `modified_at`: one absolute value, then deltas
-// ---------------------------------------------------------------------------------------------
-
 /// Signed distance between two stamps, as the column carries it.
 fn stamp_delta(previous: Hlc, next: Hlc) -> Result<i64, CodecError> {
     i64::try_from(next.get() as i128 - previous.get() as i128)
         .map_err(|_| CodecError::TimestampOverflow)
 }
 
-fn write_modified_at_column(out: &mut Vec<u8>, entries: &[Entry]) -> Result<(), CodecError> {
+fn write_stamp_column(
+    buf: &mut Vec<u8>,
+    entries: &[Entry],
+    accessor: impl Fn(&Entry) -> Hlc,
+) -> Result<(), CodecError> {
     // Slot 0 is absolute and carries no marker semantics: there is nothing to repeat and nothing to
     // be a delta from, so a `0` here is simply a timestamp of zero.
     write_ivarint(
-        out,
-        i64::try_from(entries[0].modified_at.get()).map_err(|_| CodecError::TimestampOverflow)?,
+        buf,
+        i64::try_from(accessor(&entries[0]).get()).map_err(|_| CodecError::TimestampOverflow)?,
     );
     let mut i = 1;
     while i < entries.len() {
-        let previous = entries[i - 1].modified_at;
-        if entries[i].modified_at == previous {
+        let previous = accessor(&entries[i - 1]);
+        if accessor(&entries[i]) == previous {
             let start = i;
-            while i < entries.len() && entries[i].modified_at == previous {
+            while i < entries.len() && accessor(&entries[i]) == previous {
                 i += 1;
             }
-            write_ivarint(out, REPEAT_MARKER);
-            write_uvarint(out, (i - start) as u64);
+            write_ivarint(buf, REPEAT_MARKER);
+            write_uvarint(buf, (i - start) as u64);
         } else {
-            write_ivarint(out, stamp_delta(previous, entries[i].modified_at)?);
+            write_ivarint(buf, stamp_delta(previous, accessor(&entries[i]))?);
             i += 1;
         }
     }
     Ok(())
 }
 
-fn read_modified_at_column(input: &mut &[u8], count: usize) -> Result<Vec<Hlc>, CodecError> {
+fn read_stamp_column(input: &mut &[u8], count: usize) -> Result<Vec<Hlc>, CodecError> {
     debug_assert!(count > 0);
     let mut out = Vec::with_capacity(count.min(input.len()).max(1));
     let absolute =
@@ -687,12 +695,8 @@ mod test {
         FractionalKey::from(bytes.as_slice())
     }
 
-    fn entry(position: &[u8], session: u8, modified_at: Hlc) -> Entry {
-        Entry {
-            key: key(position, session),
-            modified_at,
-            moved: FractionalKey::NULL,
-        }
+    fn entry(position: &[u8], session: u8, moved_at: Hlc) -> Entry {
+        Entry::new(key(position, session), moved_at, FractionalKey::NULL)
     }
 
     /// Round-trips `entries`, asserting both value equality and byte-level canonicality, and returns
@@ -716,15 +720,11 @@ mod test {
     }
 
     /// The entries of a fresh index holding a bulk-generated run — the shape this format exists for.
-    fn bulk_run(count: usize, modified_at: Hlc) -> Vec<Entry> {
+    fn bulk_run(count: usize, moved_at: Hlc) -> Vec<Entry> {
         let index = FractionalIndex::new(vec![], vec![], [b'a', 0, 0, 0]);
         index
             .create_keys(0, count)
-            .map(|key| Entry {
-                key,
-                modified_at,
-                moved: FractionalKey::NULL,
-            })
+            .map(|key| Entry::new(key, moved_at, FractionalKey::NULL))
             .collect()
     }
 
@@ -904,32 +904,24 @@ mod test {
         let mut out = Vec::new();
         let short = FractionalKey::from([0x01u8, 0x02].as_slice());
 
-        let entries = vec![Entry {
-            key: short.clone(),
-            modified_at: Hlc::new(1),
-            moved: FractionalKey::NULL,
-        }];
+        let entries = vec![Entry::new(short.clone(), Hlc::new(1), FractionalKey::NULL)];
         assert_eq!(
             encode_entries(&entries, &mut out),
             Err(CodecError::MalformedKey { len: 2 })
         );
 
         // A null `key` is just as impossible: `moved` is the only field that may be null.
-        let entries = vec![Entry {
-            key: FractionalKey::NULL,
-            modified_at: Hlc::new(1),
-            moved: FractionalKey::NULL,
-        }];
+        let entries = vec![Entry::new(
+            FractionalKey::NULL,
+            Hlc::new(1),
+            FractionalKey::NULL,
+        )];
         assert_eq!(
             encode_entries(&entries, &mut out),
             Err(CodecError::MalformedKey { len: 0 })
         );
 
-        let entries = vec![Entry {
-            key: key(&[0x01], 1),
-            modified_at: Hlc::new(1),
-            moved: short,
-        }];
+        let entries = vec![Entry::new(key(&[0x01], 1), Hlc::new(1), short)];
         assert_eq!(
             encode_entries(&entries, &mut out),
             Err(CodecError::MalformedKey { len: 2 })
@@ -963,7 +955,8 @@ mod test {
         // to is folded into the process clock. Nothing here should be able to reach the far future.
         let mut entries = bulk_run(8, Hlc::new(50));
         entries[3].moved = key(&[0x99], 4);
-        entries[5].modified_at = Hlc::new(entries[5].modified_at.get() + 17);
+        entries[5].moved_at = Hlc::new(entries[5].moved_at.get() + 17);
+        entries[6].removed_at = Hlc::new(entries[6].moved_at.get() + 3);
         let encoded = roundtrip(&entries);
 
         for len in 0..encoded.len() {
@@ -984,7 +977,8 @@ mod test {
         // Small stamps, for the reason given in `rejects_truncation_at_every_offset`.
         let mut entries = bulk_run(6, Hlc::new(50));
         entries[2].moved = key(&[0x99], 4);
-        entries[4].modified_at = Hlc::new(entries[4].modified_at.get() - 3);
+        entries[4].moved_at = Hlc::new(entries[4].moved_at.get() - 3);
+        entries[1].removed_at = Hlc::new(entries[1].moved_at.get() + 3);
         let encoded = roundtrip(&entries);
         let ceiling = Hlc::now();
 
@@ -995,7 +989,9 @@ mod test {
                 let mut cursor = corrupted.as_slice();
                 if let Ok(decoded) = decode_entries(&mut cursor) {
                     assert!(
-                        decoded.iter().all(|e| e.modified_at < ceiling),
+                        decoded
+                            .iter()
+                            .all(|e| e.moved_at < ceiling && e.removed_at < ceiling),
                         "byte {i} bit {bit} decoded into a stamp the clock would be stuck with"
                     );
                 }
@@ -1092,6 +1088,9 @@ mod test {
             payload.extend_from_slice(&[1, 0, 0, 0]);
             write_uvarint(&mut payload, 2); // one session, both entries
             write_ivarint(&mut payload, 500);
+            write_ivarint(&mut payload, REPEAT_MARKER);
+            write_uvarint(&mut payload, 1);
+            write_ivarint(&mut payload, 0); // never removed
             write_ivarint(&mut payload, REPEAT_MARKER);
             write_uvarint(&mut payload, 1);
             write_uvarint(&mut payload, NULL_MARKER);
@@ -1211,7 +1210,7 @@ mod test {
                 write_position_literal(&mut naive, position_of(&e.key));
             }
             assert!(
-                encoded.len() <= naive.len() + 12,
+                encoded.len() <= naive.len() + 15,
                 "{count} entries: {} bytes beats neither literals nor the other columns",
                 encoded.len()
             );

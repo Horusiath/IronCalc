@@ -14,11 +14,203 @@ use crate::worksheet::WorksheetDimension;
 /// Cells a row keeps in a sorted array; one more turns it into blocks.
 const ROW_ARRAY_LEN: usize = 256;
 
-/// The cells of a [`Stable`](crate::collab::model::Stable) sheet, filed under their row and column
-/// identity keys. Iteration order is unspecified. No stored row is empty: replicas compare equal
-/// whether or not a losing write ever filed the row.
-#[derive(Clone, Debug, Default, PartialEq, Encode, Decode)]
-pub struct CellMap(HashMap<FractionalKey, HashMap<FractionalKey, Cell>>);
+/// The cells of a [`Stable`] sheet, filed under their row and column identity keys and iterated in
+/// key order (rows by row key, cells by column key), which is not display order after a move. No
+/// stored row is empty: replicas compare equal whether or not a losing write ever filed the row.
+#[derive(Clone, Debug, Default, Encode, Decode)]
+pub struct CellMap {
+    rows: Blocks<Row>,
+    /// Number of cells in each column.
+    #[bitcode(skip)]
+    col_counts: HashMap<FractionalKey, u32, KeyBuild>,
+    /// Which rows hold `ArrayFormula` anchor.
+    #[bitcode(skip)]
+    anchor_rows: HashSet<FractionalKey, KeyBuild>,
+    /// Where the last access landed; see `seek_row`. Not encoded, not compared.
+    #[bitcode(skip)]
+    cursor: std::cell::Cell<Cursor>,
+}
+
+impl PartialEq for CellMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Cursor {
+    row: Option<At>,
+    col: u32, // a slot in an `Array` row
+}
+
+/// One row's cells, sorted by column key, never empty. `Array` if it holds at most
+/// `ROW_ARRAY_LEN` cells, so equal contents have one representation.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+enum Row {
+    Array {
+        keys: Vec<FractionalKey>,
+        cells: Vec<Cell>,
+    },
+    Wide(Blocks<Cell>),
+}
+
+/// Finds `col` at the cursor's slot, then the next one, else by search; the cursor keeps the slot
+/// found or the insertion point.
+fn col_slot(
+    cursor: &std::cell::Cell<Cursor>,
+    keys: &[FractionalKey],
+    col: &FractionalKey,
+) -> Result<usize, usize> {
+    let mut at = cursor.get();
+    let hint = at.col as usize;
+    let found = if keys.get(hint) == Some(col) {
+        Ok(hint)
+    } else if keys.get(hint + 1) == Some(col) {
+        Ok(hint + 1)
+    } else {
+        keys.binary_search(col)
+    };
+    at.col = match found {
+        Ok(slot) | Err(slot) => slot as u32,
+    };
+    cursor.set(at);
+    found
+}
+
+impl Row {
+    fn single(col: FractionalKey, cell: Cell) -> Self {
+        Row::Array {
+            keys: vec![col],
+            cells: vec![cell],
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Row::Array { keys, .. } => keys.is_empty(),
+            Row::Wide(cells) => cells.is_empty(),
+        }
+    }
+
+    fn get(&self, col: &FractionalKey, cursor: &std::cell::Cell<Cursor>) -> Option<&Cell> {
+        match self {
+            Row::Array { keys, cells } => col_slot(cursor, keys, col).ok().map(|i| &cells[i]),
+            Row::Wide(cells) => cells.lookup(col),
+        }
+    }
+
+    fn get_mut(
+        &mut self,
+        col: &FractionalKey,
+        cursor: &std::cell::Cell<Cursor>,
+    ) -> Option<&mut Cell> {
+        match self {
+            Row::Array { keys, cells } => col_slot(cursor, keys, col).ok().map(|i| &mut cells[i]),
+            Row::Wide(cells) => {
+                let at = cells.find(col).ok()?;
+                Some(cells.get_mut(at))
+            }
+        }
+    }
+
+    fn insert(
+        &mut self,
+        col: FractionalKey,
+        cell: Cell,
+        cursor: &std::cell::Cell<Cursor>,
+    ) -> Option<Cell> {
+        match self {
+            Row::Array { keys, cells } => match col_slot(cursor, keys, &col) {
+                Ok(i) => Some(std::mem::replace(&mut cells[i], cell)),
+                Err(_) if keys.len() == ROW_ARRAY_LEN => {
+                    let mut wide = Blocks::from_sorted(keys.drain(..).zip(cells.drain(..)));
+                    wide.insert(col, cell);
+                    *self = Row::Wide(wide);
+                    None
+                }
+                Err(i) => {
+                    keys.reserve_exact(1);
+                    cells.reserve_exact(1);
+                    keys.insert(i, col);
+                    cells.insert(i, cell);
+                    None
+                }
+            },
+            Row::Wide(cells) => cells.insert(col, cell),
+        }
+    }
+
+    fn remove(&mut self, col: &FractionalKey, cursor: &std::cell::Cell<Cursor>) -> Option<Cell> {
+        match self {
+            Row::Array { keys, cells } => {
+                let i = col_slot(cursor, keys, col).ok()?;
+                keys.remove(i);
+                Some(cells.remove(i))
+            }
+            Row::Wide(cells) => {
+                let removed = cells.remove(col);
+                self.shrink();
+                removed
+            }
+        }
+    }
+
+    fn retain(&mut self, keep: impl FnMut(&FractionalKey, &mut Cell) -> bool) {
+        match self {
+            Row::Array { keys, cells } => retain_entries(keys, cells, keep),
+            Row::Wide(cells) => {
+                cells.retain(keep);
+                self.shrink();
+            }
+        }
+    }
+
+    /// Turns a wide row that dropped to `ROW_ARRAY_LEN` cells back into an array.
+    fn shrink(&mut self) {
+        let Row::Wide(wide) = self else {
+            return;
+        };
+        if wide.len() > ROW_ARRAY_LEN {
+            return;
+        }
+        let mut keys = Vec::with_capacity(wide.len());
+        let mut cells = Vec::with_capacity(wide.len());
+        for (col, cell) in std::mem::take(wide).into_entries() {
+            keys.push(col);
+            cells.push(cell);
+        }
+        *self = Row::Array { keys, cells };
+    }
+
+    fn iter(&self) -> RowCells<'_> {
+        match self {
+            Row::Array { keys, cells } => RowCells::Array(keys.iter().zip(cells.iter())),
+            Row::Wide(cells) => RowCells::Wide(cells.iter()),
+        }
+    }
+}
+
+fn is_anchor(cell: &Cell) -> bool {
+    matches!(cell, Cell::ArrayFormula { .. })
+}
+
+fn uncount(counts: &mut HashMap<FractionalKey, u32, KeyBuild>, col: &FractionalKey) {
+    match counts.get_mut(col) {
+        Some(count) if *count > 1 => *count -= 1,
+        Some(_) => {
+            counts.remove(col);
+        }
+        None => debug_assert!(false, "column count underflow"),
+    }
+}
+
+/// The first and last 1-based positions of `axis` whose key `held` accepts.
+fn extent(axis: &FractionalIndex, held: impl Fn(&FractionalKey) -> bool) -> Option<(i32, i32)> {
+    let held_at = |i: &usize| axis.key(*i).is_some_and(&held);
+    let first = (0..axis.len()).find(held_at)?;
+    let last = (first..axis.len()).rev().find(held_at)?;
+    Some((first as i32 + 1, last as i32 + 1))
+}
 
 impl CellMap {
     /// The row `key`, or its insertion point. Steps from the cursor's row to the next one before
@@ -168,8 +360,54 @@ impl CellMap {
                 anchor_rows.remove(row);
                 return false;
             }
-            !cells.is_empty()
+            true
         });
+        cursor.take();
+    }
+
+    /// Recomputes the derived column counts and anchor rows from the cells.
+    pub fn rebuild_derived(&mut self) {
+        self.cursor.take();
+        self.col_counts.clear();
+        self.anchor_rows.clear();
+        for (row, cells) in self.rows.iter() {
+            for (col, cell) in cells.iter() {
+                *self.col_counts.entry(col.clone()).or_insert(0) += 1;
+                if is_anchor(cell) {
+                    self.anchor_rows.insert(row.clone());
+                }
+            }
+        }
+    }
+
+    /// The 1-based extent of the stored cells, anchors' areas included; `None` when there are none.
+    pub fn dimension(&self, index: &SheetIndexes) -> Option<WorksheetDimension> {
+        let (min_row, mut max_row) = extent(&index.rows, |key| self.rows.find(key).is_ok())?;
+        let (min_column, mut max_column) =
+            extent(&index.cols, |key| self.col_counts.contains_key(key))?;
+        for row_key in &self.anchor_rows {
+            let (Some(cells), Some(row)) = (
+                self.rows.lookup(row_key),
+                Stable::row_ordinal(index, row_key),
+            ) else {
+                continue;
+            };
+            for (col_key, cell) in cells.iter() {
+                let Cell::ArrayFormula { r, .. } = cell else {
+                    continue;
+                };
+                if let Some(column) = Stable::col_ordinal(index, col_key) {
+                    max_row = max_row.max(row + r.1.max(1) - 1);
+                    max_column = max_column.max(column + r.0.max(1) - 1);
+                }
+            }
+        }
+        Some(WorksheetDimension {
+            min_row,
+            max_row,
+            min_column,
+            max_column,
+        })
     }
 
     /// Rows holding at least one cell, each with its cells.

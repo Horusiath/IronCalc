@@ -24,6 +24,7 @@ use crate::types::{
     WorkbookSettings, Worksheet,
 };
 use crate::tz::Tz;
+use crate::worksheet::WorksheetDimension;
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -174,27 +175,53 @@ impl Position for Stable {
         first_column: i32,
         last_column: i32,
     ) -> impl Iterator<Item = (i32, Cow<'_, Cell>)> {
-        let mut cells: std::collections::BTreeMap<i32, Cow<'_, Cell>> =
-            Self::stored_columns_in_row(sheet, row)
-                .into_iter()
-                .filter(|column| (first_column..=last_column).contains(column))
-                .filter_map(|column| {
-                    Self::stored_cell(sheet, row, column).map(|cell| (column, cell))
-                })
-                .collect();
-        for (column, spill) in sheet
-            .index
-            .spills
-            .in_row_between(row, first_column, last_column)
-        {
-            match cells.get(&column) {
-                Some(stored) if !matches!(**stored, Cell::EmptyCell { .. }) => {}
-                _ => {
-                    cells.insert(column, Cow::Borrowed(spill));
+        let index = &sheet.index;
+        let mut cells: Vec<(i32, Cow<'_, Cell>)> = Vec::new();
+        if let Some(row_key) = Self::row_at(index, row) {
+            let stored = sheet.sheet_data.row_cells(&row_key);
+            let (first, last) = (
+                first_column.max(1),
+                last_column.min(index.cols.len() as i32),
+            );
+            if i64::from(last) - i64::from(first) + 1 < stored.len() as i64 {
+                // Fewer columns than cells: look each column up.
+                for column in first..=last {
+                    let cell = index
+                        .cols
+                        .key(column as usize - 1)
+                        .and_then(|col_key| sheet.sheet_data.cell(&row_key, col_key));
+                    cells.extend(cell.map(|cell| (column, Cow::Borrowed(cell))));
                 }
+            } else {
+                cells.extend(stored.filter_map(|(col_key, cell)| {
+                    let column = Self::col_ordinal(index, col_key)?;
+                    (first..=last)
+                        .contains(&column)
+                        .then_some((column, Cow::Borrowed(cell)))
+                }));
+                cells.sort_unstable_by_key(|(column, _)| *column);
             }
         }
-        cells.into_iter()
+        let mut spills = index
+            .spills
+            .in_row_between(row, first_column, last_column)
+            .peekable();
+        if spills.peek().is_none() {
+            return cells.into_iter();
+        }
+        let mut stored = cells.into_iter().peekable();
+        let mut merged = Vec::with_capacity(stored.len());
+        for (column, spill) in spills {
+            while let Some(cell) = stored.next_if(|(c, _)| *c < column) {
+                merged.push(cell);
+            }
+            match stored.next_if(|(c, _)| *c == column) {
+                Some(cell) if !matches!(*cell.1, Cell::EmptyCell { .. }) => merged.push(cell),
+                _ => merged.push((column, Cow::Borrowed(spill))),
+            }
+        }
+        merged.extend(stored);
+        merged.into_iter()
     }
 
     fn column_width(sheet: &Worksheet<Stable>, column: i32) -> Result<f64, String> {
@@ -235,6 +262,15 @@ impl Position for Stable {
             return Err(format!("Row number '{row}' is not valid."));
         }
         Ok(sheet.row_record(row).is_some_and(|record| record.hidden))
+    }
+
+    fn dimension(sheet: &Worksheet<Stable>) -> WorksheetDimension {
+        let dimension = sheet
+            .sheet_data
+            .dimension(&sheet.index)
+            .unwrap_or(WorksheetDimension::new(1, 1, 1, 1));
+        debug_assert_eq!(dimension, crate::worksheet::scan_dimension(sheet));
+        dimension
     }
 
     fn cell(sheet: &Worksheet<Stable>, row: i32, column: i32) -> Option<Cow<'_, Cell>> {
@@ -968,5 +1004,80 @@ mod test {
             stable.get_formatted_cell_value(0, 3, 2),
             Ok("20".to_string())
         );
+    }
+
+    /// The row read gives what `Position::cell` gives column by column, whichever way it walks.
+    #[test]
+    fn cells_in_row_between_reads_as_cell_does() {
+        let mut index = new_indexes();
+        mint(&mut index.rows, 3);
+        mint(&mut index.cols, 8);
+        // The first two columns to the end: column key order is no longer display order.
+        index.cols.move_to(0..2, 8);
+        let mut ws = Worksheet::<Stable> {
+            dimension: String::new(),
+            cols: vec![],
+            rows: vec![],
+            name: "Stable".to_string(),
+            sheet_data: CellMap::default(),
+            shared_formulas: vec![],
+            sheet_id: 1,
+            state: SheetState::Visible,
+            color: Color::None,
+            merged_cells: vec![],
+            comments: vec![],
+            frozen_rows: 0,
+            frozen_columns: 0,
+            show_grid_lines: true,
+            conditional_formatting: vec![],
+            links: HashMap::new(),
+            index,
+        };
+        let number = |v: f64| Cell::NumberCell { v, s: 0 };
+        for (column, cell) in [
+            (1, number(1.0)),
+            (3, number(3.0)),
+            (4, Cell::EmptyCell { s: 0 }),
+            (6, number(6.0)),
+            (8, number(8.0)),
+        ] {
+            Stable::store_cell(&mut ws, 2, column, cell).unwrap();
+        }
+        // Over an empty cell, over nothing, under a stored value, past the index, other rows.
+        for (row, column) in [(2, 4), (2, 5), (2, 6), (2, 10), (1, 3), (3, 2)] {
+            ws.index
+                .spills
+                .insert(row, column, number(f64::from(100 * row + column)))
+                .unwrap();
+        }
+
+        // 5 cells in row 2: ranges of 1 to 4 columns look columns up, wider ones walk the cells.
+        let ranges = [
+            (1, 8),
+            (0, 12),
+            (3, 4),
+            (4, 6),
+            (5, 5),
+            (9, 10),
+            (4, 3),
+            (-3, 2),
+        ];
+        for row in [0, 1, 2, 3, 4] {
+            for (first, last) in ranges {
+                let read: Vec<_> = Stable::cells_in_row_between(&ws, row, first, last)
+                    .map(|(column, cell)| (column, cell.into_owned()))
+                    .collect();
+                let expected: Vec<_> = (first..=last)
+                    .filter_map(|column| {
+                        Some((column, Stable::cell(&ws, row, column)?.into_owned()))
+                    })
+                    .collect();
+                assert_eq!(read, expected, "row {row}, columns {first}..={last}");
+            }
+        }
+        let read: Vec<_> = Stable::cells_in_row_between(&ws, 2, 1, 8)
+            .map(|(column, _)| column)
+            .collect();
+        assert_eq!(read, vec![1, 3, 4, 5, 6, 8]);
     }
 }

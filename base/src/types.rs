@@ -407,6 +407,11 @@ pub trait Position: sealed::Sealed + Sized + Clone {
     fn row_height(sheet: &Worksheet<Self>, row: i32) -> Result<f64, String>;
     fn is_row_hidden(sheet: &Worksheet<Self>, row: i32) -> Result<bool, String>;
 
+    /// The extent of the sheet's stored cells, anchors' areas included; `(1, 1, 1, 1)` when empty.
+    fn dimension(sheet: &Worksheet<Self>) -> crate::worksheet::WorksheetDimension {
+        crate::worksheet::scan_dimension(sheet)
+    }
+
     /// The cell at `(row, column)`: what `sheet_data` holds.
     fn cell(sheet: &Worksheet<Self>, row: i32, column: i32) -> Option<Cow<'_, Cell>>;
     /// Stores a spilled cell at `(row, column)`.

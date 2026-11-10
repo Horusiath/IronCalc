@@ -102,6 +102,7 @@ impl Snapshot for CollabModel<'static> {
         }
         for sheet in &mut model.workbook.worksheets {
             rebuild_touched(&mut sheet.index);
+            sheet.sheet_data.rebuild_derived();
         }
         model.index_unresolved();
         model.resync_parsed();

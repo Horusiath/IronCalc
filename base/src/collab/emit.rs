@@ -1355,8 +1355,7 @@ impl CollabModel<'_> {
                 cells.push((row_key.clone(), column_key.clone()));
             }
         }
-        // `sheet_data` is a hash map: sort, so the commit does not depend on its iteration.
-        cells.sort();
+        // In key order already: `sheet_data` iterates by row key, then column key.
         for at in cells {
             let Some(prev) = self.cell_style_at(i, &at) else {
                 continue; // nothing to clear
@@ -1444,7 +1443,7 @@ impl CollabModel<'_> {
                         rows.push(row);
                     }
                 }
-                // `sheet_data` is a hash map: sort, so the commit does not depend on its iteration.
+                // Display order, not the key order `sheet_data` iterates in.
                 rows.sort();
                 rows.dedup();
                 for row in rows {
@@ -2509,9 +2508,7 @@ impl CollabModel<'_> {
                 }
             }
         }
-        // `sheet_data` is a hash map, and the payload travels: sort so it does not depend on it.
-        cell_values.sort_by(|(a, _), (b, _)| a.cmp(b));
-        cell_styles.sort_by(|(a, _), (b, _)| a.cmp(b));
+        // In key order already: `sheet_data` iterates by row key, then column key.
         // References a row or column delete took along are dead: see `derive_cell`.
         let registers = &sheet.index.registers.cell_styles;
         let mut cell_parents: Vec<_> = sheet
@@ -4634,6 +4631,85 @@ mod test {
         );
         let expected = WorksheetDimension::new(1, 3, 1, 1);
         assert_eq!(models[0].workbook.worksheets[0].dimension(), expected);
+    }
+
+    #[test]
+    fn dimension_of_an_empty_sheet() {
+        let mut m = CollabModel::new(1);
+        m.new_sheet();
+        let expected = WorksheetDimension::new(1, 1, 1, 1);
+        assert_eq!(m.workbook.worksheets[0].dimension(), expected);
+    }
+
+    /// The extent is in display order, not in the key order of the rows holding cells.
+    #[test]
+    fn dimension_follows_moved_rows() {
+        let mut m = CollabModel::new(1);
+        m.new_sheet();
+        for (row, column) in [(1, 1), (2, 2), (3, 3)] {
+            m.set_user_input(0, row, column, "x".to_string()).unwrap();
+        }
+        m.insert_rows(0, 4, 3).unwrap();
+        m.move_rows_action(0, 1, 1, 5).unwrap(); // the first row to row 6
+        let expected = WorksheetDimension::new(1, 6, 1, 3);
+        assert_eq!(m.workbook.worksheets[0].dimension(), expected);
+        m.move_rows_action(0, 6, 1, -4).unwrap(); // back between the other two
+        let expected = WorksheetDimension::new(1, 3, 1, 3);
+        assert_eq!(m.workbook.worksheets[0].dimension(), expected);
+        assert_eq!(m.get_formatted_cell_value(0, 2, 1), Ok("x".to_string()));
+    }
+
+    /// A deleted outermost row leaves the extent; an edit newer than the delete brings it back.
+    #[test]
+    fn dimension_counts_a_revived_outermost_row() {
+        let mut models = replicas(&[(1, 1, "top"), (2, 1, "mid"), (3, 1, "last")]);
+        let [a, b, _] = &mut models;
+        a.delete_rows(0, 3, 1).unwrap();
+        let deleted = a.flush();
+        let expected = WorksheetDimension::new(1, 2, 1, 1);
+        assert_eq!(a.workbook.worksheets[0].dimension(), expected);
+        b.set_user_input(0, 3, 2, "new".to_string()).unwrap(); // stamped after the delete
+        let edit = b.flush();
+
+        deliver_delete_and_edit(&mut models, &deleted, &edit);
+        assert_converged(&mut models, &[(3, 1, ""), (3, 2, "new")]);
+        let expected = WorksheetDimension::new(1, 3, 1, 2);
+        assert_eq!(models[0].workbook.worksheets[0].dimension(), expected);
+    }
+
+    #[test]
+    fn dimension_shrinks_when_a_column_delete_takes_the_outermost_cells() {
+        let mut m = CollabModel::new(1);
+        m.new_sheet();
+        for (row, column) in [(2, 2), (3, 3), (4, 4)] {
+            m.set_user_input(0, row, column, "x".to_string()).unwrap();
+        }
+        assert_eq!(
+            m.workbook.worksheets[0].dimension(),
+            WorksheetDimension::new(2, 4, 2, 4)
+        );
+        m.delete_columns(0, 4, 1).unwrap();
+        assert_eq!(
+            m.workbook.worksheets[0].dimension(),
+            WorksheetDimension::new(2, 3, 2, 3)
+        );
+        m.delete_columns(0, 2, 1).unwrap(); // C3 becomes B3
+        assert_eq!(
+            m.workbook.worksheets[0].dimension(),
+            WorksheetDimension::new(3, 3, 2, 2)
+        );
+    }
+
+    #[test]
+    fn dimension_includes_a_cse_area() {
+        let mut m = CollabModel::new(1);
+        m.new_sheet();
+        m.set_user_input(0, 1, 1, "x".to_string()).unwrap();
+        m.set_user_array_formula(0, 2, 2, 3, 4, "=1").unwrap(); // B2:D5
+        let expected = WorksheetDimension::new(1, 5, 1, 4);
+        assert_eq!(m.workbook.worksheets[0].dimension(), expected);
+        m.evaluate();
+        assert_eq!(m.workbook.worksheets[0].dimension(), expected);
     }
 
     /// The inverse of `commits`, newest first: what an undo commits.

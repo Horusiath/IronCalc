@@ -63,7 +63,7 @@ impl<'a, A: Position> Model<'a, A> {
         let worksheet = self.workbook.worksheet(sheet_index)?;
         let mut hidden = false;
         for row_style in &worksheet.rows {
-            if A::row_ordinal(&worksheet.index, &row_style.r) == Some(row) {
+            if row_style.r == row {
                 hidden = row_style.hidden;
                 break;
             }

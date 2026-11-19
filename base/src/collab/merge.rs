@@ -2,11 +2,11 @@
 
 use crate::collab::fractional_index::{FractionalIndex, FractionalKey};
 use crate::collab::log::Timestamp;
-use crate::collab::model::{CollabModel, Stable, StableCellAddress, StableRange};
+use crate::collab::model::{CollabModel, StableCellAddress, StableRange};
 use crate::collab::patch::{Patch, Property};
 use crate::expressions::types::Area;
 use crate::merged_cells::{merge_across_ranges, merge_down_ranges};
-use crate::types::{Alignment, Cell, HorizontalAlignment, MergedCell, Position};
+use crate::types::{Alignment, Cell, HorizontalAlignment};
 use std::cmp::Ordering;
 
 /// The keys of ordinals `first..=last` on `index`, and the tail keys that have to be inserted
@@ -121,11 +121,11 @@ impl CollabModel<'_> {
         let id = self.sheet_of(sheet)?;
         let worksheet = self.workbook.worksheet(sheet)?;
         let rect = (row, column, row + height - 1, column + width - 1);
-        let patches: Vec<Patch> = worksheet
-            .merged_cells
-            .iter()
+        // The keys a patch names come from the source, so a merge is found by what it resolves to.
+        let patches: Vec<Patch> = (worksheet.index.merges.iter())
             .filter(|range| {
-                Stable::resolve_merged(range, &worksheet.index)
+                range
+                    .merged_rect(&worksheet.index)
                     .is_some_and(|stored| intersects(stored, rect))
             })
             .map(|range| Patch::SetMergedRange {
@@ -140,22 +140,6 @@ impl CollabModel<'_> {
         }
         self.commit_local(patches);
         Ok(())
-    }
-
-    /// The merged cells of the worksheet as ordinal rectangles.
-    /// A range whose corners the sheet no longer resolves is skipped.
-    pub fn get_merged_cells(&self, sheet: u32) -> Result<Vec<MergedCell>, String> {
-        Ok(self
-            .workbook
-            .worksheet(sheet)?
-            .merged_ranges()
-            .map(|(row, column, last_row, last_column)| MergedCell {
-                row,
-                column,
-                width: last_column - column + 1,
-                height: last_row - row + 1,
-            })
-            .collect())
     }
 
     /// Merges `range` as one commit:
@@ -230,8 +214,9 @@ impl CollabModel<'_> {
                 }),
                 None => {}
             }
-            if let Some(link) = self.workbook.worksheets[i].links.get(&source).cloned() {
-                let prev = self.workbook.worksheets[i].links.get(&anchor).cloned();
+            let links = &self.workbook.worksheets[i].index.links;
+            if let Some(link) = links.get(&source).cloned() {
+                let prev = links.get(&anchor).cloned();
                 patches.push(Patch::SetCellLink {
                     sheet: id,
                     at: anchor.clone(),
@@ -256,7 +241,7 @@ impl CollabModel<'_> {
                         prev: Box::new(self.cell_input(i, &at)),
                     });
                 }
-                if let Some(link) = self.workbook.worksheets[i].links.get(&at).cloned() {
+                if let Some(link) = self.workbook.worksheets[i].index.links.get(&at).cloned() {
                     patches.push(Patch::SetCellLink {
                         sheet: id,
                         at,
@@ -314,15 +299,13 @@ impl CollabModel<'_> {
     pub(crate) fn reconcile_merges(&mut self) {
         let mut cancelled = Vec::new();
         for worksheet in &self.workbook.worksheets {
-            if worksheet.merged_cells.len() < 2 {
+            let index = &worksheet.index;
+            if index.merges.len() < 2 {
                 continue;
             }
-            let index = &worksheet.index;
-            let live: Vec<MergeEntry> = worksheet
-                .merged_cells
-                .iter()
+            let live: Vec<MergeEntry> = (index.merges.iter())
                 .filter_map(|range| {
-                    let rect = Stable::resolve_merged(range, index)?;
+                    let rect = range.merged_rect(index)?;
                     let ts = index
                         .registers
                         .merges
@@ -377,6 +360,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::collab::log::Commit;
+    use crate::collab::model::Stable;
+    use crate::types::MergedCell;
     use crate::types::Worksheet;
     use crate::UserModel;
 
@@ -396,7 +381,9 @@ mod tests {
     }
 
     fn rects(sheet: &Worksheet<Stable>) -> Vec<(i32, i32, i32, i32)> {
-        let mut out: Vec<_> = sheet.merged_ranges().collect();
+        let mut out: Vec<_> = (sheet.merged_cells.iter())
+            .map(|m| (m.row, m.column, m.last_row(), m.last_column()))
+            .collect();
         out.sort();
         out
     }
@@ -651,7 +638,7 @@ mod tests {
         for m in [&mut a, &mut b] {
             assert!(m.get_merged_cells(0).unwrap().is_empty());
             assert!(m.model.workbook.worksheets[0]
-                .merged_range_containing(2, 2)
+                .merged_cell_containing(2, 2)
                 .is_none());
         }
 
@@ -707,6 +694,67 @@ mod tests {
             assert_eq!(m.get_formatted_cell_value(0, 2, 2).unwrap(), "x");
         }
         converged(&a.model, &b.model);
+    }
+
+    #[test]
+    fn merge_follows_a_concurrently_moved_corner() {
+        use crate::collab::spill::test::{converged, deliver, peer};
+        let (mut a, mut b) = (peer(1), peer(2));
+        a.new_sheet().unwrap();
+        for row in 1..=5 {
+            a.set_user_input(0, row, 1, &row.to_string()).unwrap();
+        }
+        deliver(&mut a, &mut b);
+
+        a.merge_cells(&area(2, 2, 2, 2)).unwrap(); // B2:C3
+        b.move_rows_action(0, 3, 1, 2).unwrap(); // row 3 to row 5, the merge unseen
+        let (from_a, from_b) = (a.flush_send_queue(), b.flush_send_queue());
+        b.apply_external_diffs(&from_a).unwrap();
+        a.apply_external_diffs(&from_b).unwrap();
+
+        let expected = vec![MergedCell {
+            row: 2,
+            column: 2,
+            width: 2,
+            height: 4,
+        }];
+        for m in [&a, &b] {
+            assert_eq!(m.get_formatted_cell_value(0, 5, 1).unwrap(), "3");
+            assert_eq!(m.get_merged_cells(0).unwrap(), expected);
+        }
+        converged(&mut a, &mut b);
+    }
+
+    #[test]
+    fn merge_deleted_whole_comes_back_with_its_undo() {
+        use crate::collab::spill::test::{converged, deliver, peer};
+        let (mut a, mut b) = (peer(1), peer(2));
+        a.new_sheet().unwrap();
+        a.set_user_input(0, 2, 2, "x").unwrap();
+        a.set_user_input(0, 5, 1, "below").unwrap();
+        a.merge_cells(&area(2, 2, 2, 2)).unwrap(); // B2:C3
+        deliver(&mut a, &mut b);
+
+        a.delete_rows(0, 2, 2).unwrap();
+        deliver(&mut a, &mut b);
+        for m in [&a, &b] {
+            assert!(m.get_merged_cells(0).unwrap().is_empty());
+            assert_eq!(m.get_formatted_cell_value(0, 3, 1).unwrap(), "below");
+        }
+
+        a.undo().unwrap();
+        deliver(&mut a, &mut b);
+        let expected = vec![MergedCell {
+            row: 2,
+            column: 2,
+            width: 2,
+            height: 2,
+        }];
+        for m in [&a, &b] {
+            assert_eq!(m.get_merged_cells(0).unwrap(), expected);
+            assert_eq!(m.get_formatted_cell_value(0, 2, 2).unwrap(), "x");
+        }
+        converged(&mut a, &mut b);
     }
 
     #[test]

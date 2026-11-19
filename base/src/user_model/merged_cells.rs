@@ -190,11 +190,6 @@ impl UserModel<'_> {
         Ok(())
     }
 
-    /// Returns the list of merged cells of the worksheet.
-    pub fn get_merged_cells(&self, sheet: u32) -> Result<Vec<MergedCell>, String> {
-        Ok(self.model.get_merged_cells(sheet)?.to_vec())
-    }
-
     // Captures the undo diffs for the content and links that merging `range`
     // will clear: everything but the anchor.
     pub(super) fn covered_cells_clear_diffs(&self, range: &Area) -> Result<Vec<Diff>, String> {
@@ -285,15 +280,14 @@ impl UserModel<'_, crate::collab::model::Stable> {
             Ok(())
         })
     }
-
-    /// Returns the merged cells of the worksheet as ordinal rectangles, as the UI expects them.
-    /// A stable range whose corners the sheet no longer resolves is skipped.
-    pub fn get_merged_cells(&self, sheet: u32) -> Result<Vec<MergedCell>, String> {
-        self.model.get_merged_cells(sheet)
-    }
 }
 
 impl<A: crate::types::Position> UserModel<'_, A> {
+    /// Returns the list of merged cells of the worksheet.
+    pub fn get_merged_cells(&self, sheet: u32) -> Result<Vec<MergedCell>, String> {
+        Ok(self.model.get_merged_cells(sheet)?.to_vec())
+    }
+
     // A covered cell can never stay selected: if the selected cell is now
     // inside the merged area, select the whole area — all the merged cells of
     // a multi-range merge ("across", "down") — with the top-left anchor as

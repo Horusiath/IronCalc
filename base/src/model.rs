@@ -997,7 +997,7 @@ impl<'a, A: Position> Model<'a, A> {
                     continue;
                 }
                 // Merged cells always block spilling.
-                if worksheet.merged_range_containing(r, c).is_some() {
+                if worksheet.merged_cell_containing(r, c).is_some() {
                     return true;
                 }
                 // A cell blocks spilling only if it is occupied by something other than
@@ -1382,7 +1382,7 @@ impl<'a, A: Position> Model<'a, A> {
                     if (r, c) == (row, column) {
                         continue;
                     }
-                    if worksheet.merged_range_containing(r, c).is_some() {
+                    if worksheet.merged_cell_containing(r, c).is_some() {
                         blocked = true;
                         continue;
                     }
@@ -1443,7 +1443,7 @@ impl<'a, A: Position> Model<'a, A> {
             }
         }
         for (_, r, c) in clears {
-            worksheet.cell_clear_contents(r, c)?;
+            A::clear_spill(worksheet, r, c)?;
         }
         Ok(None)
     }
@@ -1464,7 +1464,7 @@ impl<'a, A: Position> Model<'a, A> {
         }
         let worksheet = self.workbook.worksheet_mut(anchor.sheet)?;
         for (_, r, c) in clears {
-            worksheet.cell_clear_contents(r, c)?;
+            A::clear_spill(worksheet, r, c)?;
         }
         Ok(true)
     }
@@ -1702,9 +1702,9 @@ impl<'a, A: Position> Model<'a, A> {
             // A row the sheet holds as numbers is copied as it is. Not while
             // the pass is being abandoned: nothing read then is a value.
             if self.evaluation.restart.is_none() && !self.evaluation.unwinding {
-                let worksheet = &self.workbook.worksheets[left.sheet as usize];
+                let sheet_data = &self.workbook.worksheets[left.sheet as usize].sheet_data;
                 if let Some(row_numbers) =
-                    worksheet.numbers_in_row_between(row, left.column, right.column)
+                    sheet_data.numbers_in_row_between(row, left.column, right.column)
                 {
                     numbers.extend_from_slice(row_numbers);
                     continue;
@@ -1793,8 +1793,9 @@ impl<'a, A: Position> Model<'a, A> {
             return (column, last_column + 1);
         }
         let shared_strings = &self.workbook.shared_strings;
-        let mut cells =
-            self.workbook.worksheets[sheet as usize].cells_in_row_between(row, column, last_column);
+        let mut cells = self.workbook.worksheets[sheet as usize]
+            .sheet_data
+            .cells_in_row_between(row, column, last_column);
         let mut next = column;
         // A position without a cell holds nothing, like an empty cell.
         let mut read_empty = |from: i32, to: i32, push: &mut dyn FnMut(ArrayNode)| {
@@ -1847,6 +1848,7 @@ impl<'a, A: Position> Model<'a, A> {
     #[inline(always)]
     pub(crate) fn fetch_cell(&self, cell_reference: CellReferenceIndex) -> Option<Cow<'_, Cell>> {
         self.workbook.worksheets[cell_reference.sheet as usize]
+            .sheet_data
             .cell(cell_reference.row, cell_reference.column)
     }
 
@@ -2154,10 +2156,8 @@ impl<'a, A: Position> Model<'a, A> {
                     self.language,
                 ),
                 Some(i) => {
-                    // Anchored at the cell it lives in, so its relative references keep their
-                    // offsets; the target only picks where those offsets are rendered from.
-                    let formula = &A::materialize_formula(self, sheet, row, column, i)
-                        .ok_or("missing formula")?;
+                    let (formula, _static_result) =
+                        &self.parsed_formulas[sheet as usize][i as usize];
                     let cell_ref = CellReferenceRC {
                         sheet: self.workbook.worksheets[sheet as usize].get_name(),
                         row: target_row,
@@ -2262,7 +2262,11 @@ impl<'a, A: Position> Model<'a, A> {
         match worksheet.cell(row, column) {
             Some(cell) => match cell.get_formula() {
                 Some(formula_index) => {
-                    let formula = &A::materialize_formula(self, sheet, row, column, formula_index)
+                    let (formula, _static_result) = &self
+                        .parsed_formulas
+                        .get(sheet as usize)
+                        .ok_or("missing sheet")?
+                        .get(formula_index as usize)
                         .ok_or("missing formula")?;
                     let cell_ref = CellReferenceRC {
                         sheet: worksheet.get_name(),
@@ -2294,7 +2298,11 @@ impl<'a, A: Position> Model<'a, A> {
         match worksheet.cell(row, column) {
             Some(cell) => match cell.get_formula() {
                 Some(formula_index) => {
-                    let formula = &A::materialize_formula(self, sheet, row, column, formula_index)
+                    let (formula, _static_result) = &self
+                        .parsed_formulas
+                        .get(sheet as usize)
+                        .ok_or("missing sheet")?
+                        .get(formula_index as usize)
                         .ok_or("missing formula")?;
                     let cell_ref = CellReferenceRC {
                         sheet: worksheet.get_name(),
@@ -3221,8 +3229,7 @@ impl<'a, A: Position> Model<'a, A> {
         };
         match cell.get_formula() {
             Some(formula_index) => {
-                let formula = &A::materialize_formula(self, sheet, row, column, formula_index)
-                    .ok_or("missing formula")?;
+                let formula = &self.parsed_formulas[sheet as usize][formula_index as usize].0;
                 let cell_ref = CellReferenceRC {
                     sheet: worksheet.get_name(),
                     row,
@@ -3271,7 +3278,7 @@ impl<'a, A: Position> Model<'a, A> {
     pub fn get_all_cells(&self) -> Vec<CellIndex> {
         let mut cells = Vec::new();
         for (index, sheet) in self.workbook.worksheets.iter().enumerate() {
-            for (row, column, _) in sheet.cells_in_order() {
+            for (row, column, _) in sheet.sheet_data.cells() {
                 cells.push(CellIndex {
                     index: index as u32,
                     row,
@@ -3478,7 +3485,31 @@ impl<'a, A: Position> Model<'a, A> {
     /// Returns the style index for cell (`sheet`, `row`, `column`)
     pub fn get_cell_style_index(&self, sheet: u32, row: i32, column: i32) -> Result<i32, String> {
         // First check the cell, then row, the column
-        Ok(self.workbook.worksheet(sheet)?.get_style(row, column))
+        let cell = self.workbook.worksheet(sheet)?.cell(row, column);
+
+        match cell {
+            Some(cell) => Ok(cell.get_style()),
+            None => {
+                let rows = &self.workbook.worksheet(sheet)?.rows;
+                for r in rows {
+                    if r.r == row {
+                        if r.custom_format {
+                            return Ok(r.s);
+                        }
+                        break;
+                    }
+                }
+                let cols = &self.workbook.worksheet(sheet)?.cols;
+                for c in cols.iter() {
+                    let min = c.min;
+                    let max = c.max;
+                    if column >= min && column <= max {
+                        return Ok(c.style.unwrap_or(0));
+                    }
+                }
+                Ok(0)
+            }
+        }
     }
 
     /// Returns the style for cell (`sheet`, `row`, `column`)
@@ -3894,25 +3925,6 @@ impl<'a> Model<'a> {
             Err("Defined name not found".to_string())
         }
     }
-    /// Returns the style object of a column, if any
-    pub fn get_column_style(&self, sheet: u32, column: i32) -> Result<Option<Style>, String> {
-        if let Some(worksheet) = self.workbook.worksheets.get(sheet as usize) {
-            let cols = &worksheet.cols;
-            for col in cols {
-                if column >= col.min && column <= col.max {
-                    if let Some(style_index) = col.style {
-                        let style = self.workbook.styles.get_style(style_index)?;
-                        return Ok(Some(style));
-                    }
-                    return Ok(None);
-                }
-            }
-            Ok(None)
-        } else {
-            Err("Invalid sheet".to_string())
-        }
-    }
-
     /// Returns the style object of a row, if any
     pub fn get_row_style(&self, sheet: u32, row: i32) -> Result<Option<Style>, String> {
         if let Some(worksheet) = self.workbook.worksheets.get(sheet as usize) {
@@ -3990,6 +4002,25 @@ impl<'a> Model<'a> {
 
 /// Reads and evaluation: everything here runs on any addressing scheme.
 impl<'a, A: Position> Model<'a, A> {
+    /// Returns the style object of a column, if any
+    pub fn get_column_style(&self, sheet: u32, column: i32) -> Result<Option<Style>, String> {
+        if let Some(worksheet) = self.workbook.worksheets.get(sheet as usize) {
+            let cols = &worksheet.cols;
+            for col in cols {
+                if column >= col.min && column <= col.max {
+                    if let Some(style_index) = col.style {
+                        let style = self.workbook.styles.get_style(style_index)?;
+                        return Ok(Some(style));
+                    }
+                    return Ok(None);
+                }
+            }
+            Ok(None)
+        } else {
+            Err("Invalid sheet".to_string())
+        }
+    }
+
     /// Sets the language
     pub fn set_language(&mut self, language_id: &str) -> Result<(), String> {
         let language = match get_language(language_id) {

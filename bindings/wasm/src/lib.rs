@@ -13,7 +13,7 @@ use ironcalc_base::{
         types::Area,
         utils::{column_to_number, number_to_column, quote_name as quote_name_ic},
     },
-    types::{CellType, Color, Position, Style, StyleIncludes},
+    types::{CellType, Color, Style, StyleIncludes},
     worksheet::NavigationDirection,
     BorderArea, ClipboardData, UserModel,
 };
@@ -610,27 +610,30 @@ impl Model {
     // This two are only used when we want to compute the automatic width of a column or height of a row
     #[wasm_bindgen(js_name = "getRowsWithData")]
     pub fn get_rows_with_data(&self, sheet: u32, column: i32) -> Result<Vec<i32>, JsError> {
-        let worksheet = self
+        let sheet_data = &self
             .model
             .get_model()
             .workbook
             .worksheet(sheet)
-            .map_err(to_js_error)?;
-        Ok(Pos::stored_cells(worksheet)
-            .filter(|(_, c, _)| *c == column)
-            .map(|(row, _, _)| row)
+            .map_err(to_js_error)?
+            .sheet_data;
+        Ok(sheet_data
+            .rows()
+            .into_iter()
+            .filter(|row| sheet_data.cell(*row, column).is_some())
             .collect())
     }
 
     #[wasm_bindgen(js_name = "getColumnsWithData")]
     pub fn get_columns_with_data(&self, sheet: u32, row: i32) -> Result<Vec<i32>, JsError> {
-        let worksheet = self
+        Ok(self
             .model
             .get_model()
             .workbook
             .worksheet(sheet)
-            .map_err(to_js_error)?;
-        Ok(Pos::stored_columns_in_row(worksheet, row))
+            .map_err(to_js_error)?
+            .sheet_data
+            .columns_in_row(row))
     }
 
     #[wasm_bindgen(js_name = "updateRangeStyle")]

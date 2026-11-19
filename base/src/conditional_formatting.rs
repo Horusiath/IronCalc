@@ -129,15 +129,15 @@ impl<'a, A: Position> Model<'a, A> {
                         let ranges: Vec<(i32, i32, i32, i32)> = cf
                             .ranges
                             .iter()
-                            .filter_map(|r| {
-                                let (r1, c1, mut r2, mut c2) = A::resolve_range(r, &ws.index)?;
+                            .map(|r| {
+                                let (r1, c1, mut r2, mut c2) = r.resolve();
                                 if r.rows.is_none() {
                                     r2 = r2.min(dim.max_row);
                                 }
                                 if r.cols.is_none() {
                                     c2 = c2.min(dim.max_column);
                                 }
-                                Some((r1, c1, r2, c2))
+                                (r1, c1, r2, c2)
                             })
                             .collect();
                         if ranges.is_empty() {
@@ -1378,7 +1378,7 @@ impl<'a, A: Position> Model<'a, A> {
         sheet: u32,
     ) -> Result<Vec<ConditionalFormattingView>, String> {
         let ws = self.workbook.worksheet(sheet)?;
-        let mut list: Vec<(usize, ConditionalFormatting<A>)> = ws
+        let mut list: Vec<(usize, ConditionalFormatting)> = ws
             .conditional_formatting
             .iter()
             .cloned()
@@ -1389,15 +1389,9 @@ impl<'a, A: Position> Model<'a, A> {
         let mut result = Vec::with_capacity(list.len());
         for (index, mut cf) in list {
             self.cf_rule_to_display(&mut cf.cf_rule, sheet);
-            // Ranges are shown as the ordinals they currently denote, whatever they are stored as.
-            let ordinal: Vec<RangeRef> = cf
-                .ranges
-                .iter()
-                .filter_map(|r| A::to_ordinal_range(r, &ws.index))
-                .collect();
             result.push(ConditionalFormattingView {
                 index,
-                range: RangeRef::to_sqref(&ordinal),
+                range: RangeRef::to_sqref(&cf.ranges),
                 cf_rule: cf.cf_rule,
                 priority: cf.priority,
             });

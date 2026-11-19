@@ -143,8 +143,17 @@ fn projection_identity() {
 
     // The identity above must come from the mapping, not from the projection being a no-op: reorder
     // the rows on the stable side and every ordinal the projection reports has to follow. Nothing
-    // public moves a row without also displacing what points at it, so the index is moved directly.
+    // public moves a row without also displacing what points at it, so the index is moved directly,
+    // and the cells and row records with it as applying a move does.
     a.workbook.worksheets[0].index.rows.move_to(0..1, 5); // first row of five to the end
+    a.workbook.worksheets[0].sheet_data.move_row(1, 5);
+    let records = &mut a.workbook.worksheets[0].rows;
+    for row in records.iter_mut() {
+        row.r = if row.r == 1 { 5 } else { row.r - 1 };
+    }
+    records.sort_by_key(|row| row.r);
+    // ...and the sparse items re-derived from their keys, as the end of a commit does.
+    a.derive_sparse(0);
     let projected = a.to_ordinal_workbook();
     let moved = &projected.worksheets[0];
     assert_ne!(moved.sheet_data, out.sheet_data);
@@ -169,12 +178,12 @@ fn projection_identity() {
             height: 2,
         }]
     );
-    // The projection maps corners, it does not re-normalize them: A1:B5 comes back inverted because
-    // its top row is now the bottom one.
+    // A1:B5's corners now sit at 5 and 4: the range is the region between them, ordered as
+    // evaluation and the rule list read it (`resolve_axis`), so the ordinal range is never inverted.
     assert_eq!(
         moved.conditional_formatting[0].ranges,
         vec![RangeRef {
-            rows: Some((5, 4)),
+            rows: Some((4, 5)),
             cols: Some((1, 2))
         }]
     );

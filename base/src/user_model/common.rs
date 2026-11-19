@@ -188,12 +188,6 @@ pub(crate) fn update_style(
     Ok(style)
 }
 
-/// The columns row `row` currently holds a cell in, left to right. A key the index no longer
-/// addresses names no position, and is skipped.
-fn row_columns<A: Position>(worksheet: &crate::types::Worksheet<A>, row: i32) -> Vec<i32> {
-    A::stored_columns_in_row(worksheet, row)
-}
-
 /// # A wrapper around [`Model`] for a spreadsheet end user.
 /// UserModel is a wrapper around Model with undo/redo history, _diffs_, automatic evaluation and view management.
 ///
@@ -1899,12 +1893,10 @@ impl<'a, A: Position> UserModel<'a, A> {
     ) -> Result<Option<i32>, String> {
         let worksheet = self.model.workbook.worksheet(sheet)?;
         let mut last_column = None;
-        for col in row_columns::<A>(worksheet, row) {
+        for (col, cell) in worksheet.sheet_data.cells_in_row(row) {
             if col < column {
-                if let Some(cell) = worksheet.cell(row, col) {
-                    if matches!(*cell, Cell::EmptyCell { .. }) {
-                        continue;
-                    }
+                if matches!(*cell, Cell::EmptyCell { .. }) {
+                    continue;
                 }
                 last_column = Some(col);
             }
@@ -1922,12 +1914,10 @@ impl<'a, A: Position> UserModel<'a, A> {
         column: i32,
     ) -> Result<Option<i32>, String> {
         let worksheet = self.model.workbook.worksheet(sheet)?;
-        for col in row_columns::<A>(worksheet, row) {
+        for (col, cell) in worksheet.sheet_data.cells_in_row(row) {
             if col > column {
-                if let Some(cell) = worksheet.cell(row, col) {
-                    if matches!(*cell, Cell::EmptyCell { .. }) {
-                        continue;
-                    }
+                if matches!(*cell, Cell::EmptyCell { .. }) {
+                    continue;
                 }
                 return Ok(Some(col));
             }

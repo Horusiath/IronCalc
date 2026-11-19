@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use bitcode::{Decode, Encode};
 
 use super::row::Row;
-use crate::constants::LAST_ROW;
+use crate::constants::{LAST_COLUMN, LAST_ROW};
 use crate::types::Cell;
 
 const CHUNK_BITS: u32 = 10;
@@ -211,19 +211,181 @@ impl SheetData {
 
     /// Removes every cell of a row, and the row.
     pub fn remove_row(&mut self, row: i32) {
-        let Some((chunk_index, index)) = locate(row) else {
+        self.take_row(row);
+    }
+
+    /// Removes a row and returns it.
+    fn take_row(&mut self, row: i32) -> Option<Row> {
+        let (chunk_index, index) = locate(row)?;
+        let chunk = self.chunks.get_mut(chunk_index)?.as_mut()?;
+        let taken = chunk.rows[index].take()?;
+        chunk.used -= 1;
+        self.row_count -= 1;
+        if chunk.used == 0 {
+            self.chunks[chunk_index] = None;
+        }
+        Some(taken)
+    }
+
+    /// Moves a row, if it exists, into the place of one that does not. A row
+    /// moved outside the sheet is gone.
+    fn move_row_slot(&mut self, from: i32, to: i32) {
+        if from == to || self.row(from).is_none() {
             return;
-        };
-        let Some(Some(chunk)) = self.chunks.get_mut(chunk_index) else {
-            return;
-        };
-        if chunk.rows[index].take().is_some() {
-            chunk.used -= 1;
-            self.row_count -= 1;
-            if chunk.used == 0 {
-                self.chunks[chunk_index] = None;
+        }
+        // The place is made before the row leaves, so that a chunk left
+        // empty by one row and filled by the next is not freed in between.
+        let inside = self.row_or_insert(to).is_some();
+        let taken = self.take_row(from);
+        if let (true, Some(taken)) = (inside, taken) {
+            if let Some(slot) = self.row_mut(to) {
+                *slot = taken;
             }
         }
+    }
+
+    /// The rows that exist from `first` to `last`, both included, ascending.
+    fn rows_between(&self, first: i32, last: i32) -> Vec<i32> {
+        self.rows_in_order()
+            .map(|(row, _)| row)
+            .skip_while(|row| *row < first)
+            .take_while(|row| *row <= last)
+            .collect()
+    }
+
+    /// Rows numbered `at` and up move down by `count`; rows pushed past the
+    /// last row are dropped.
+    pub fn insert_rows(&mut self, at: i32, count: i32) {
+        if count <= 0 || locate(at).is_none() {
+            return;
+        }
+        // From the bottom up, so that every row moves into a place already left
+        for row in self.rows_between(at, LAST_ROW).into_iter().rev() {
+            self.move_row_slot(row, row + count);
+        }
+    }
+
+    /// Rows `at..at + count` are removed; the rows after them move up by
+    /// `count`.
+    pub fn remove_rows(&mut self, at: i32, count: i32) {
+        if count <= 0 || locate(at).is_none() {
+            return;
+        }
+        let end = at + count;
+        // From the top down, so that every row moves into a place already left
+        for row in self.rows_between(at, LAST_ROW) {
+            if row < end {
+                self.take_row(row);
+            } else {
+                self.move_row_slot(row, row - count);
+            }
+        }
+    }
+
+    /// The row at `from` ends up at `to`; the rows between shift by one
+    /// towards `from`.
+    pub fn move_row(&mut self, from: i32, to: i32) {
+        if from == to || locate(from).is_none() || locate(to).is_none() {
+            return;
+        }
+        let moving = self.take_row(from);
+        if from < to {
+            for row in self.rows_between(from + 1, to) {
+                self.move_row_slot(row, row - 1);
+            }
+        } else {
+            for row in self.rows_between(to, from - 1).into_iter().rev() {
+                self.move_row_slot(row, row + 1);
+            }
+        }
+        if let Some(moving) = moving {
+            if let Some(slot) = self.row_or_insert(to) {
+                *slot = moving;
+            }
+        }
+    }
+
+    /// Moves the cells of every row as `f` says, see [`Row::remap_columns`].
+    /// A row left without cells goes, as it does with `remove_cell`; a row
+    /// that had none stays.
+    fn remap_columns(&mut self, f: impl Fn(i32) -> Option<i32>) {
+        let SheetData { chunks, row_count } = self;
+        for slot in chunks.iter_mut() {
+            let Some(chunk) = slot else {
+                continue;
+            };
+            for row_slot in chunk.rows.iter_mut() {
+                let Some(row) = row_slot else {
+                    continue;
+                };
+                let was_empty = row.is_empty();
+                row.remap_columns(&f);
+                if !was_empty && row.is_empty() {
+                    *row_slot = None;
+                    chunk.used -= 1;
+                    *row_count -= 1;
+                }
+            }
+            if chunk.used == 0 {
+                *slot = None;
+            }
+        }
+    }
+
+    /// In every row, cells in columns `at` and up move right by `count`;
+    /// cells pushed past the last column are dropped, and a row left without
+    /// cells by that goes.
+    pub fn insert_columns(&mut self, at: i32, count: i32) {
+        if count <= 0 || !(1..=LAST_COLUMN).contains(&at) {
+            return;
+        }
+        self.remap_columns(|column| {
+            if column < at {
+                Some(column)
+            } else {
+                column
+                    .checked_add(count)
+                    .filter(|column| *column <= LAST_COLUMN)
+            }
+        });
+    }
+
+    /// Cells in columns `at..at + count` are removed, and so is a row left
+    /// without cells by that; cells after them move left by `count`.
+    pub fn remove_columns(&mut self, at: i32, count: i32) {
+        if count <= 0 || !(1..=LAST_COLUMN).contains(&at) {
+            return;
+        }
+        let end = at.saturating_add(count);
+        self.remap_columns(|column| {
+            if column < at {
+                Some(column)
+            } else if column < end {
+                None
+            } else {
+                Some(column - count)
+            }
+        });
+    }
+
+    /// The cell at column `from` of every row ends up at `to`; the cells
+    /// between shift by one towards `from`.
+    pub fn move_column(&mut self, from: i32, to: i32) {
+        let columns = 1..=LAST_COLUMN;
+        if from == to || !columns.contains(&from) || !columns.contains(&to) {
+            return;
+        }
+        self.remap_columns(|column| {
+            Some(if column == from {
+                to
+            } else if from < column && column <= to {
+                column - 1
+            } else if to <= column && column < from {
+                column + 1
+            } else {
+                column
+            })
+        });
     }
 
     /// Replaces the cells of a row. The row exists afterwards, even with no

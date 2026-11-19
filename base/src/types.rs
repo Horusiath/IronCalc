@@ -1,15 +1,12 @@
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use std::{
-    borrow::Cow,
     collections::HashMap,
     fmt::Display,
     hash::{Hash, Hasher},
 };
 
-use crate::constants::{COLUMN_WIDTH_FACTOR, DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT};
-use crate::expressions::parser::Node;
-use crate::model::Model;
+use crate::constants::DEFAULT_ROW_HEIGHT;
 use crate::user_model::OrdinalUserState;
 use crate::{
     cf_types::ConditionalFormatting,
@@ -17,8 +14,7 @@ use crate::{
     expressions::{
         token::Error,
         utils::{
-            column_to_number, is_valid_column, is_valid_column_number, is_valid_row,
-            number_to_column, parse_reference_a1,
+            column_to_number, is_valid_column, is_valid_row, number_to_column, parse_reference_a1,
         },
     },
     ROW_HEIGHT_FACTOR,
@@ -293,19 +289,6 @@ impl From<&MergedCell> for RangeRef {
     }
 }
 
-impl From<&RangeRef> for MergedCell {
-    /// Unbounded axes span the whole grid.
-    fn from(r: &RangeRef) -> MergedCell {
-        let (row, column, last_row, last_column) = r.resolve();
-        MergedCell {
-            row,
-            column,
-            width: last_column - column + 1,
-            height: last_row - row + 1,
-        }
-    }
-}
-
 pub(crate) mod sealed {
     pub trait Sealed {}
 }
@@ -315,15 +298,8 @@ pub(crate) mod sealed {
 /// `Clone` is a supertrait so that the `#[derive]`s on the generic containers, which emit
 /// `A: Clone` bounds, are satisfied by a bare `A: Position`.
 pub trait Position: sealed::Sealed + Sized + Clone {
-    /// Row/column identifier. Bounds are the union of what the containers' derives need.
-    type Key: Clone + Ord + Hash + std::fmt::Debug + Encode + bitcode::DecodeOwned;
     /// Per-sheet ordering context; `()` for [`Ordinal`].
     type SheetIndex: Clone + Default + std::fmt::Debug + PartialEq + Encode + bitcode::DecodeOwned;
-    /// How the cells of a sheet are stored.
-    type SheetData: Clone + Default + std::fmt::Debug + PartialEq + Encode + bitcode::DecodeOwned;
-    /// How a merged range is stored: an anchor plus a size ([`MergedCell`]) when
-    /// the addressing is positional, a keyed [`RangeRef`] when it is stable.
-    type MergedCell: Clone + std::fmt::Debug + PartialEq + Encode + bitcode::DecodeOwned;
     /// Workbook-wide replication metadata; `()` for [`Ordinal`].
     type WorkbookMeta: Clone + Default + std::fmt::Debug + PartialEq + Encode + bitcode::DecodeOwned;
     /// Replica-local model state, never serialized; `()` for [`Ordinal`].
@@ -331,113 +307,27 @@ pub trait Position: sealed::Sealed + Sized + Clone {
     /// Replica-local state of the [`UserModel`](crate::UserModel) wrapper: undo/redo and whatever
     /// else the wrapper keeps outside the workbook.
     type UserState: Default;
-    /// Storage form of a shared formula: R1C1 text under [`Ordinal`], a bound token stream under
-    /// [`Stable`](crate::collab::model::Stable).
-    type Formula: Clone + PartialEq + std::fmt::Debug + Encode + bitcode::DecodeOwned;
-    /// Storage form of a cell hyperlink: a plain [`Link`] under [`Ordinal`], a link whose internal
-    /// location is a bound stream under [`Stable`](crate::collab::model::Stable).
-    type Link: Clone + PartialEq + std::fmt::Debug + Encode + bitcode::DecodeOwned;
 
-    // Key ⇄ ordinal resolution. Ordinals are the 1-based `i32` the rest of the codebase uses;
-    // `None` means the key names nothing in this index any more.
-    fn row_ordinal(idx: &Self::SheetIndex, key: &Self::Key) -> Option<i32>;
-    fn col_ordinal(idx: &Self::SheetIndex, key: &Self::Key) -> Option<i32>;
-    fn row_at(idx: &Self::SheetIndex, ordinal: i32) -> Option<Self::Key>;
-    fn col_at(idx: &Self::SheetIndex, ordinal: i32) -> Option<Self::Key>;
-
-    /// How many rows/columns this index currently addresses. The whole grid under [`Ordinal`].
-    fn row_count(idx: &Self::SheetIndex) -> i32;
-    fn col_count(idx: &Self::SheetIndex) -> i32;
-
-    /// The 1-based ordinal rectangle `(row1, column1, row2, column2)` a range currently denotes,
-    /// or `None` if it collapsed.
-    fn resolve_range(
-        range: &RangeRef<Self>,
-        idx: &Self::SheetIndex,
-    ) -> Option<(i32, i32, i32, i32)>;
-
-    /// The range as ordinals: each corner is the 1-based index its key currently sits at, and an
-    /// unbounded axis stays unbounded. `None` when a corner names nothing any more.
-    fn to_ordinal_range(range: &RangeRef<Self>, idx: &Self::SheetIndex) -> Option<RangeRef>;
-
-    /// The 1-based ordinal rectangle `(row1, column1, row2, column2)` a merged range currently
-    /// covers, or `None` if it collapsed.
-    fn resolve_merged(
-        merged: &Self::MergedCell,
-        idx: &Self::SheetIndex,
-    ) -> Option<(i32, i32, i32, i32)>;
-
-    // Cell storage, by ordinal. Per-representation because `SheetData` is.
-    fn stored_cell(sheet: &Worksheet<Self>, row: i32, column: i32) -> Option<Cow<'_, Cell>>;
-    fn stored_cell_mut(sheet: &mut Worksheet<Self>, row: i32, column: i32) -> Option<&mut Cell>;
-    fn store_cell(
-        sheet: &mut Worksheet<Self>,
-        row: i32,
-        column: i32,
-        cell: Cell,
-    ) -> Result<(), String>;
-    /// Every stored cell, in row-major ordinal order.
-    fn stored_cells(sheet: &Worksheet<Self>) -> impl Iterator<Item = (i32, i32, Cow<'_, Cell>)>;
-    /// The columns a row holds a cell in, left to right.
-    fn stored_columns_in_row(sheet: &Worksheet<Self>, row: i32) -> Vec<i32>;
-    /// The cells of a row from `first_column` to `last_column`, both included, with their
-    /// column, in ascending order of column.
-    fn cells_in_row_between(
-        sheet: &Worksheet<Self>,
-        row: i32,
-        first_column: i32,
-        last_column: i32,
-    ) -> impl Iterator<Item = (i32, Cow<'_, Cell>)>;
-    /// The numbers of a row from `first_column` to `last_column`, both included, if the sheet
-    /// holds them as numbers and nothing else, with none missing. `None` is no news about the
-    /// row: a fast path only, so a representation without one answers `None`.
-    fn numbers_in_row_between(
-        _sheet: &Worksheet<Self>,
+    /// A spill cell was written at `(row, column)` over `replaced`.
+    fn spill_written(
+        _sheet: &mut Worksheet<Self>,
         _row: i32,
-        _first_column: i32,
-        _last_column: i32,
-    ) -> Option<&[f64]> {
-        None
+        _column: i32,
+        _replaced: Option<&Cell>,
+    ) {
     }
-
-    // Row/column metrics. Genuinely per-representation: [`Ordinal`] reads the ranged `Col`/`Row`
-    // records by index, stable addressing resolves a key and its covering spans.
-    fn column_width(sheet: &Worksheet<Self>, column: i32) -> Result<f64, String>;
-    fn is_column_hidden(sheet: &Worksheet<Self>, column: i32) -> Result<bool, String>;
-    fn row_height(sheet: &Worksheet<Self>, row: i32) -> Result<f64, String>;
-    fn is_row_hidden(sheet: &Worksheet<Self>, row: i32) -> Result<bool, String>;
-
-    /// The extent of the sheet's stored cells, anchors' areas included; `(1, 1, 1, 1)` when empty.
-    fn dimension(sheet: &Worksheet<Self>) -> crate::worksheet::WorksheetDimension {
-        crate::worksheet::scan_dimension(sheet)
-    }
-
-    /// The cell at `(row, column)`: what `sheet_data` holds.
-    fn cell(sheet: &Worksheet<Self>, row: i32, column: i32) -> Option<Cow<'_, Cell>>;
-    /// Stores a spilled cell at `(row, column)`.
-    fn write_spill(
-        sheet: &mut Worksheet<Self>,
-        row: i32,
-        column: i32,
-        cell: Cell,
-    ) -> Result<(), String>;
-    /// Drops every spilled cell of the sheet, before a full re-evaluation rebuilds them.
+    /// Drops every spill cell of the sheet, where spills are derived.
     fn drop_spills(_sheet: &mut Worksheet<Self>) {}
-    /// Whether a CSE array's covered cells are derived like a dynamic spill:
+    /// Clears the spill cell at `(row, column)` that its anchor gave up.
+    fn clear_spill(sheet: &mut Worksheet<Self>, row: i32, column: i32) -> Result<(), String> {
+        sheet.cell_clear_contents(row, column)
+    }
+
+    /// Whether spills are derived, rebuilt from nothing by every evaluation, and a CSE array's
+    /// covered cells with them:
     /// - `false` for Ordinal
     /// - `true` for Stable
     const CSE_SPILLS: bool = false;
-
-    /// The AST the formula interned at `index` on `sheet` is *shown* as:
-    /// 1. For [Ordinal] is pretty much identity function.
-    /// 2. For [Stable] is a lowered stable references to construct a specific node.
-    fn materialize_formula<'b>(
-        model: &'b Model<Self>,
-        sheet: u32,
-        row: i32,
-        column: i32,
-        index: i32,
-    ) -> Option<std::borrow::Cow<'b, Node>>;
 }
 
 /// Positional addressing: rows and columns are 1-based indices.
@@ -452,201 +342,21 @@ pub struct Ordinal;
 impl sealed::Sealed for Ordinal {}
 
 impl Position for Ordinal {
-    type Key = i32;
     type SheetIndex = ();
-    type SheetData = crate::sheet_data::SheetData;
-    type MergedCell = MergedCell;
     type WorkbookMeta = ();
     type Local = ();
     type UserState = OrdinalUserState;
-    type Formula = String;
-    type Link = Link;
-
-    // The key *is* the ordinal, so resolution is the identity and there is nothing to bound-check.
-    #[inline]
-    fn row_ordinal(_idx: &(), key: &i32) -> Option<i32> {
-        Some(*key)
-    }
-    #[inline]
-    fn col_ordinal(_idx: &(), key: &i32) -> Option<i32> {
-        Some(*key)
-    }
-    #[inline]
-    fn row_at(_idx: &(), ordinal: i32) -> Option<i32> {
-        Some(ordinal)
-    }
-    #[inline]
-    fn col_at(_idx: &(), ordinal: i32) -> Option<i32> {
-        Some(ordinal)
-    }
-
-    #[inline]
-    fn row_count(_idx: &()) -> i32 {
-        LAST_ROW
-    }
-    #[inline]
-    fn col_count(_idx: &()) -> i32 {
-        LAST_COLUMN
-    }
-    #[inline]
-    fn resolve_merged(merged: &MergedCell, _idx: &()) -> Option<(i32, i32, i32, i32)> {
-        Some((
-            merged.row,
-            merged.column,
-            merged.last_row(),
-            merged.last_column(),
-        ))
-    }
-
-    fn resolve_range(range: &RangeRef, _idx: &()) -> Option<(i32, i32, i32, i32)> {
-        Some(range.resolve())
-    }
-
-    #[inline]
-    fn to_ordinal_range(range: &RangeRef, _idx: &()) -> Option<RangeRef> {
-        Some(range.clone())
-    }
-
-    #[inline]
-    fn stored_cell(sheet: &Worksheet, row: i32, column: i32) -> Option<Cow<'_, Cell>> {
-        sheet.sheet_data.cell(row, column)
-    }
-    #[inline]
-    fn stored_cell_mut(sheet: &mut Worksheet, row: i32, column: i32) -> Option<&mut Cell> {
-        sheet.sheet_data.cell_mut(row, column)
-    }
-    #[inline]
-    fn store_cell(sheet: &mut Worksheet, row: i32, column: i32, cell: Cell) -> Result<(), String> {
-        sheet.sheet_data.set_cell(row, column, cell);
-        Ok(())
-    }
-    #[inline]
-    fn stored_cells(sheet: &Worksheet) -> impl Iterator<Item = (i32, i32, Cow<'_, Cell>)> {
-        sheet.sheet_data.cells()
-    }
-    #[inline]
-    fn stored_columns_in_row(sheet: &Worksheet, row: i32) -> Vec<i32> {
-        sheet.sheet_data.columns_in_row(row)
-    }
-    #[inline]
-    fn cells_in_row_between(
-        sheet: &Worksheet,
-        row: i32,
-        first_column: i32,
-        last_column: i32,
-    ) -> impl Iterator<Item = (i32, Cow<'_, Cell>)> {
-        sheet
-            .sheet_data
-            .cells_in_row_between(row, first_column, last_column)
-    }
-    #[inline]
-    fn numbers_in_row_between(
-        sheet: &Worksheet,
-        row: i32,
-        first_column: i32,
-        last_column: i32,
-    ) -> Option<&[f64]> {
-        sheet
-            .sheet_data
-            .numbers_in_row_between(row, first_column, last_column)
-    }
-
-    fn column_width(sheet: &Worksheet, column: i32) -> Result<f64, String> {
-        if !is_valid_column_number(column) {
-            return Err(format!("Column number '{column}' is not valid."));
-        }
-        for col in &sheet.cols {
-            if column >= col.min && column <= col.max {
-                if col.hidden {
-                    return Ok(0.0);
-                }
-                if col.custom_width {
-                    return Ok(col.width * COLUMN_WIDTH_FACTOR);
-                }
-                break;
-            }
-        }
-        Ok(DEFAULT_COLUMN_WIDTH)
-    }
-
-    fn is_column_hidden(sheet: &Worksheet, column: i32) -> Result<bool, String> {
-        if !is_valid_column_number(column) {
-            return Err(format!("Column number '{column}' is not valid."));
-        }
-        for col in &sheet.cols {
-            if column >= col.min && column <= col.max {
-                return Ok(col.hidden);
-            }
-        }
-        Ok(false)
-    }
-
-    fn row_height(sheet: &Worksheet, row: i32) -> Result<f64, String> {
-        if !is_valid_row(row) {
-            return Err(format!("Row number '{row}' is not valid."));
-        }
-        for r in &sheet.rows {
-            if r.r == row {
-                if r.hidden {
-                    return Ok(0.0);
-                }
-                return Ok(r.height * ROW_HEIGHT_FACTOR);
-            }
-        }
-        Ok(DEFAULT_ROW_HEIGHT)
-    }
-
-    fn is_row_hidden(sheet: &Worksheet, row: i32) -> Result<bool, String> {
-        if !is_valid_row(row) {
-            return Err(format!("Row number '{row}' is not valid."));
-        }
-        for r in &sheet.rows {
-            if r.r == row {
-                return Ok(r.hidden);
-            }
-        }
-        Ok(false)
-    }
-
-    #[inline]
-    fn cell(sheet: &Worksheet, row: i32, column: i32) -> Option<Cow<'_, Cell>> {
-        sheet.stored_cell(row, column)
-    }
-    #[inline]
-    fn write_spill(sheet: &mut Worksheet, row: i32, column: i32, cell: Cell) -> Result<(), String> {
-        sheet.update_cell(row, column, cell)
-    }
-
-    /// The stored node already carries offsets from wherever the formula sits, so it *is* the
-    /// display form.
-    fn materialize_formula<'b>(
-        model: &'b Model,
-        sheet: u32,
-        _row: i32,
-        _column: i32,
-        index: i32,
-    ) -> Option<std::borrow::Cow<'b, Node>> {
-        let (node, _) = model
-            .parsed_formulas
-            .get(sheet as usize)?
-            .get(index as usize)?;
-        Some(std::borrow::Cow::Borrowed(node.as_ref()))
-    }
 }
 
 /// A cell position: (row, column), 1-based.
-pub type CellAddr<A = Ordinal> = (<A as Position>::Key, <A as Position>::Key);
+pub type CellAddr = (i32, i32);
 
 /// A rectangular reference. An axis is a closed 1-based interval, or `None`
 /// meaning the whole axis (full-column `D:D`, full-row `5:7`).
 #[derive(Serialize, Deserialize, Encode, Decode, Debug, PartialEq, Eq, Hash, Clone)]
-#[serde(bound(
-    serialize = "A::Key: Serialize",
-    deserialize = "A::Key: serde::Deserialize<'de>"
-))]
-pub struct RangeRef<A: Position = Ordinal> {
-    pub rows: Option<(A::Key, A::Key)>,
-    pub cols: Option<(A::Key, A::Key)>,
+pub struct RangeRef {
+    pub rows: Option<(i32, i32)>,
+    pub cols: Option<(i32, i32)>,
 }
 
 /// One side of an A1 reference: a column index, a row index, or both.
@@ -778,36 +488,36 @@ impl RangeRef {
 #[derive(Encode, Decode, Debug, PartialEq, Clone)]
 pub struct Worksheet<A: Position = Ordinal> {
     pub dimension: String,
-    pub cols: Vec<Col<A>>,
-    pub rows: Vec<Row<A>>,
+    pub cols: Vec<Col>,
+    pub rows: Vec<Row>,
     pub name: String,
-    pub sheet_data: SheetData<A>,
-    pub shared_formulas: Vec<A::Formula>,
+    pub sheet_data: SheetData,
+    pub shared_formulas: Vec<String>,
     pub sheet_id: u32,
     pub state: SheetState,
     pub color: Color,
-    pub merged_cells: Vec<A::MergedCell>,
-    pub comments: Vec<Comment<A>>,
+    pub merged_cells: Vec<MergedCell>,
+    pub comments: Vec<Comment>,
     pub frozen_rows: i32,
     pub frozen_columns: i32,
     /// Whether or not to show the grid lines in the worksheet
     pub show_grid_lines: bool,
-    pub conditional_formatting: Vec<ConditionalFormatting<A>>,
+    pub conditional_formatting: Vec<ConditionalFormatting>,
     /// Hyperlinks in the worksheet, keyed by (row, column) of the cell they are attached to
-    pub links: HashMap<CellAddr<A>, A::Link>,
+    pub links: HashMap<CellAddr, Link>,
     /// The ordering context every key in this sheet resolves against; `()` for [`Ordinal`].
     pub index: A::SheetIndex,
 }
 
 /// Internal representation of Excel's sheet_data
 /// It is row first and because of this all of our API's should be row first
-pub type SheetData<A = Ordinal> = <A as Position>::SheetData;
+pub use crate::sheet_data::SheetData;
 
 // ECMA-376-1:2016 section 18.3.1.73
 #[derive(Encode, Decode, Debug, PartialEq, Clone)]
-pub struct Row<A: Position = Ordinal> {
+pub struct Row {
     /// Row index
-    pub r: A::Key,
+    pub r: i32,
     pub height: f64,
     pub custom_format: bool,
     pub custom_height: bool,
@@ -815,7 +525,18 @@ pub struct Row<A: Position = Ordinal> {
     pub hidden: bool,
 }
 
-impl<A: Position> Row<A> {
+impl Row {
+    pub fn new(r: i32) -> Row {
+        Row {
+            r,
+            height: DEFAULT_ROW_HEIGHT / ROW_HEIGHT_FACTOR,
+            custom_format: false,
+            custom_height: false,
+            s: 0,
+            hidden: false,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.s == 0
             && !self.custom_format
@@ -827,12 +548,12 @@ impl<A: Position> Row<A> {
 
 // ECMA-376-1:2016 section 18.3.1.13
 #[derive(Encode, Decode, Debug, PartialEq, Clone)]
-pub struct Col<A: Position = Ordinal> {
+pub struct Col {
     // Column definitions are defined on ranges, unlike rows which store unique, per-row entries.
     /// First column affected by this record. Settings apply to column in \[min, max\] range.
-    pub min: A::Key,
+    pub min: i32,
     /// Last column affected by this record. Settings apply to column in \[min, max\] range.
-    pub max: A::Key,
+    pub max: i32,
     pub width: f64,
     pub custom_width: bool,
     pub hidden: bool,
@@ -967,15 +688,11 @@ impl Default for Cell {
 }
 
 #[derive(Encode, Decode, Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
-#[serde(bound(
-    serialize = "A::Key: Serialize",
-    deserialize = "A::Key: serde::Deserialize<'de>"
-))]
-pub struct Comment<A: Position = Ordinal> {
+pub struct Comment {
     pub text: String,
     pub author_name: String,
     pub author_id: Option<String>,
-    pub cell_ref: CellAddr<A>,
+    pub cell_ref: CellAddr,
 }
 
 // ECMA-376-1:2016 section 18.5.1.2
@@ -1535,10 +1252,7 @@ mod test {
         fn assert_default(w: Workbook<Ordinal>) -> Workbook {
             w
         }
-        fn assert_range_default(r: RangeRef<Ordinal>) -> RangeRef {
-            r
-        }
-        let _ = (assert_default, assert_range_default);
+        let _ = assert_default;
     }
 
     fn round_trip(s: &str) -> String {

@@ -1,7 +1,5 @@
 pub mod apply;
 pub mod bind;
-pub mod blocks;
-pub mod cell_map;
 pub mod cf;
 pub mod codec;
 pub mod emit;

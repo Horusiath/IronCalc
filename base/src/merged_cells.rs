@@ -284,14 +284,14 @@ impl<'a> Model<'a> {
             .retain(|m| !m.intersects(row, column, width, height));
         Ok(())
     }
+}
 
+impl<A: Position> Model<'_, A> {
     /// Returns the list of merged cells of the worksheet
     pub fn get_merged_cells(&self, sheet: u32) -> Result<&[MergedCell], String> {
         Ok(&self.workbook.worksheet(sheet)?.merged_cells)
     }
-}
 
-impl<A: Position> Model<'_, A> {
     // Full validation of merging `range` without touching the model: the
     // shape checks of `check_merge_range` plus the single-content-cell rule.
     // Lets a multi-range merge ("across", "down") be all-or-nothing.
@@ -355,13 +355,14 @@ impl<A: Position> Model<'_, A> {
             return Err("Cannot merge a single cell".to_string());
         }
         let worksheet = self.workbook.worksheet(sheet)?;
-        if let Some((first_row, first_column, _, _)) =
-            worksheet.merged_ranges().find(|&(r1, c1, r2, c2)| {
-                r1 < row + height && r2 >= row && c1 < column + width && c2 >= column
-            })
+        if let Some(m) = worksheet
+            .merged_cells
+            .iter()
+            .find(|m| m.intersects(row, column, width, height))
         {
             return Err(format!(
-                "Range intersects the merged cell at row {first_row}, column {first_column}"
+                "Range intersects the merged cell at row {}, column {}",
+                m.row, m.column
             ));
         }
         for r in row..row + height {
@@ -397,16 +398,14 @@ impl<A: Position> Model<'_, A> {
         column: i32,
     ) -> Result<MergeStructure, String> {
         let worksheet = self.workbook.worksheet(sheet)?;
-        Ok(match worksheet.merged_range_containing(row, column) {
-            Some((r, c, last_row, last_column)) if (r, c) == (row, column) => {
-                MergeStructure::Anchor {
-                    width: last_column - c + 1,
-                    height: last_row - r + 1,
-                }
-            }
-            Some((r, c, _, _)) => MergeStructure::Covered {
-                anchor_row: r,
-                anchor_column: c,
+        Ok(match worksheet.merged_cell_containing(row, column) {
+            Some(m) if m.row == row && m.column == column => MergeStructure::Anchor {
+                width: m.width,
+                height: m.height,
+            },
+            Some(m) => MergeStructure::Covered {
+                anchor_row: m.row,
+                anchor_column: m.column,
             },
             None => MergeStructure::None,
         })

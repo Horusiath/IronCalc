@@ -441,7 +441,7 @@ fn merged_cells_match_ordinal() {
     let check = |o: &Model, c: &CollabModel, step: &str| {
         compare(o, c, &[0], 9, 7, step);
         assert_eq!(
-            merged(&c.get_merged_cells(0).unwrap()),
+            merged(c.get_merged_cells(0).unwrap()),
             merged(o.get_merged_cells(0).unwrap()),
             "merged cells after {step}"
         );

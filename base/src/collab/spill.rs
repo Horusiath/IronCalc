@@ -1,74 +1,13 @@
-use std::collections::HashMap;
-
-use crate::expressions::utils::{is_valid_column_number, is_valid_row};
-use crate::types::Cell;
-
-/// The spilled cells of one sheet, by ordinal `(row, column)`.
-#[derive(Clone, Debug, Default)]
-pub struct Spills(HashMap<(i32, i32), Cell>);
-
-/// Derived state is never compared: two replicas agree when their *authored* state does.
-impl PartialEq for Spills {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl Spills {
-    pub(crate) fn get(&self, row: i32, column: i32) -> Option<&Cell> {
-        self.0.get(&(row, column))
-    }
-
-    /// The spills of a row from `first_column` to `last_column`, both included, with their
-    /// column, in ascending order of column.
-    pub(crate) fn in_row_between(
-        &self,
-        row: i32,
-        first_column: i32,
-        last_column: i32,
-    ) -> impl Iterator<Item = (i32, &Cell)> {
-        let mut spills: Vec<(i32, &Cell)> = self
-            .0
-            .iter()
-            .filter(|((r, c), _)| *r == row && (first_column..=last_column).contains(c))
-            .map(|((_, c), cell)| (*c, cell))
-            .collect();
-        spills.sort_unstable_by_key(|(column, _)| *column);
-        spills.into_iter()
-    }
-
-    pub(crate) fn insert(&mut self, row: i32, column: i32, cell: Cell) -> Result<(), String> {
-        if !is_valid_row(row) || !is_valid_column_number(column) {
-            return Err("Incorrect row or column".to_string());
-        }
-        self.0.insert((row, column), cell);
-        Ok(())
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    /// Drops the cells `anchor` spilled over its `(width, height)` range; whatever another anchor
-    /// spilled there stays.
-    pub(crate) fn remove_spill(&mut self, anchor: (i32, i32), (width, height): (i32, i32)) {
-        for row in anchor.0..anchor.0 + height {
-            for column in anchor.1..anchor.1 + width {
-                if let Some(Cell::SpillCell { a, .. }) = self.0.get(&(row, column)) {
-                    if *a == anchor {
-                        self.0.remove(&(row, column));
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test {
     #![allow(clippy::unwrap_used)]
+    use crate::collab::apply::SNAPSHOT_FORMAT_VERSION;
+    use crate::collab::formula::StableRef;
+    use crate::collab::log::Snapshot;
     use crate::collab::model::{CollabModel, Stable};
-    use crate::types::{ArrayKind, Cell, Position};
+    use crate::collab::patch::PropKind;
+    use crate::expressions::parser::Node;
+    use crate::types::{ArrayKind, Cell};
     use crate::user_model::CellArrayStructure;
     use crate::UserModel;
 
@@ -82,8 +21,22 @@ pub(crate) mod test {
         to.apply_external_diffs(&from.flush_send_queue()).unwrap();
     }
 
-    /// Both replicas show the same values and the same array geometry over a small rectangle.
-    pub(crate) fn converged(a: &Peer, b: &Peer) {
+    pub(crate) fn converged(a: &mut Peer, b: &mut Peer) {
+        a.evaluate();
+        b.evaluate();
+        let (ma, mb) = (a.get_model(), b.get_model());
+        assert_eq!(mb.workbook.worksheets.len(), ma.workbook.worksheets.len());
+        for (i, sheet) in ma.workbook.worksheets.iter().enumerate() {
+            assert_eq!(
+                mb.sheet_content(i),
+                ma.sheet_content(i),
+                "content of sheet {}",
+                sheet.name
+            );
+            assert_eq!(cells(mb, i), cells(ma, i), "cells of sheet {}", sheet.name);
+        }
+        assert_image(ma);
+        assert_image(mb);
         for row in 1..=6 {
             for col in 1..=4 {
                 assert_eq!(
@@ -95,6 +48,137 @@ pub(crate) mod test {
                     b.get_cell_array_structure(0, row, col),
                     a.get_cell_array_structure(0, row, col),
                     "structure at row {row} column {col}"
+                );
+            }
+        }
+    }
+
+    /// Every stored cell of the `i`-th sheet, in natural order, with what its shared string or its
+    /// formula index names: both tables fill in arrival order, so the indices are per replica. A
+    /// formula is its text, its slots and the node it lowered to.
+    #[allow(clippy::type_complexity)]
+    fn cells(
+        model: &CollabModel<'_>,
+        i: usize,
+    ) -> Vec<(
+        i32,
+        i32,
+        Cell,
+        Option<String>,
+        Option<(String, Vec<StableRef>, Node)>,
+    )> {
+        let sheet = &model.workbook.worksheets[i];
+        let text = |si: &i32| model.workbook.shared_strings.get(*si as usize).cloned();
+        let formula = |f: &i32| {
+            let f = *f as usize;
+            Some((
+                sheet.shared_formulas.get(f)?.clone(),
+                sheet.index.formulas.get(f)?.refs.clone(),
+                (*model.parsed_formulas.get(i)?.get(f)?.0).clone(),
+            ))
+        };
+        (sheet.sheet_data.cells())
+            .map(|(row, column, cell)| match cell.into_owned() {
+                Cell::SharedString { si, s } => (
+                    row,
+                    column,
+                    Cell::SharedString { si: 0, s },
+                    text(&si),
+                    None,
+                ),
+                Cell::CellFormula { f, s, v } => {
+                    let cell = Cell::CellFormula { f: 0, s, v };
+                    (row, column, cell, None, formula(&f))
+                }
+                Cell::ArrayFormula { f, s, r, kind, v } => {
+                    let cell = Cell::ArrayFormula {
+                        f: 0,
+                        s,
+                        r,
+                        kind,
+                        v,
+                    };
+                    (row, column, cell, None, formula(&f))
+                }
+                cell => (row, column, cell, None, None),
+            })
+            .collect()
+    }
+
+    /// The image of `model` is its index's. A snapshot round trip, which re-derives the sparse
+    /// records, the formula slots and the reverse sets from the index, gives the workbook back
+    /// unchanged. Every stored cell that is not a spill sits under a row and a column the index has,
+    /// and was written by a patch: its address has a value or a style register. Row records sit
+    /// under visible rows, in order. What a spill covers is an authored style, under a spill.
+    pub(crate) fn assert_image(model: &CollabModel<'_>) {
+        // What `Snapshot::encode` writes; spelled out so a borrowed model can be checked too.
+        let mut bytes = vec![SNAPSHOT_FORMAT_VERSION];
+        bytes.extend_from_slice(&bitcode::encode(&model.workbook));
+        let restored = CollabModel::decode(&bytes, 99).unwrap();
+        assert_eq!(restored.workbook, model.workbook, "snapshot round trip");
+        for sheet in &model.workbook.worksheets {
+            let index = &sheet.index;
+            for (row, column, cell) in sheet.sheet_data.cells() {
+                if matches!(*cell, Cell::SpillCell { .. }) {
+                    continue;
+                }
+                let keys = (
+                    index.rows.key(row as usize - 1),
+                    index.cols.key(column as usize - 1),
+                );
+                let (Some(r), Some(c)) = keys else {
+                    unreachable!("{cell:?} at ({row}, {column}) is outside the index");
+                };
+                let at = (r.clone(), c.clone());
+                let registers = &index.registers;
+                let written = registers.cell_values.contains_key(&at)
+                    || (PropKind::ALL.into_iter())
+                        .any(|kind| registers.cell_styles.contains_key(&(at.clone(), kind)));
+                assert!(written, "{cell:?} at ({row}, {column}) has no register");
+            }
+            // Row records sit under a visible row, in order, and a hidden row's record waits in
+            // `hidden_rows` only while the row is hidden.
+            let len = index.rows.len() as i32;
+            for row in &sheet.rows {
+                assert!(
+                    (1..=len).contains(&row.r),
+                    "row record {row:?} is outside the index"
+                );
+            }
+            assert!(
+                sheet.rows.windows(2).all(|w| w[0].r < w[1].r),
+                "row records out of order"
+            );
+            for key in index.hidden_rows.keys() {
+                assert!(
+                    index.rows.position_of(key).is_none(),
+                    "row {key:?} is visible and has a hidden record"
+                );
+            }
+            // What a spill covers is an authored style, under a spill.
+            for (&(row, column), s) in &index.covered {
+                let cell = sheet.sheet_data.cell(row, column);
+                assert!(
+                    matches!(cell.as_deref(), Some(Cell::SpillCell { .. })),
+                    "covered style {s} at ({row}, {column}) is under {cell:?}"
+                );
+                let keys = (
+                    index.rows.key(row as usize - 1),
+                    index.cols.key(column as usize - 1),
+                );
+                let (Some(r), Some(c)) = keys else {
+                    unreachable!("covered style {s} at ({row}, {column}) is outside the index");
+                };
+                let at = (r.clone(), c.clone());
+                let styled = (PropKind::ALL.into_iter()).any(|kind| {
+                    index
+                        .registers
+                        .cell_styles
+                        .contains_key(&(at.clone(), kind))
+                });
+                assert!(
+                    styled,
+                    "covered style {s} at ({row}, {column}) has no register"
                 );
             }
         }
@@ -130,7 +214,7 @@ pub(crate) mod test {
             assert!(inner.get_cell_formula(0, 1, 1).unwrap().is_some());
             assert_eq!(inner.get_cell_formula(0, 2, 1).unwrap(), None);
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
 
         b.set_user_input(0, 3, 1, "x").unwrap(); // Peer B: A3=x
         deliver(&mut b, &mut a);
@@ -142,14 +226,14 @@ pub(crate) mod test {
             // A3 was written by peer B
             assert_eq!(model.get_formatted_cell_value(0, 3, 1).unwrap(), "x");
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
 
         b.set_user_input(0, 3, 1, "").unwrap(); // unblock A1 spill
         deliver(&mut b, &mut a);
         for model in [&a, &b] {
             assert_eq!(model.get_formatted_cell_value(0, 3, 1).unwrap(), "3"); // A3=3
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
 
         a.set_user_input(0, 1, 1, "42").unwrap(); // A1=42
         deliver(&mut a, &mut b);
@@ -160,7 +244,7 @@ pub(crate) mod test {
             assert_eq!(model.get_formatted_cell_value(0, 3, 1).unwrap(), "");
             assert_eq!(structure(model, 2, 1), CellArrayStructure::SingleCell);
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
     }
 
     #[test]
@@ -235,7 +319,7 @@ pub(crate) mod test {
             assert_eq!(dimension(model), rows_and_columns(7, 5));
             assert_eq!(model.get_formatted_cell_value(0, 1, 3).unwrap(), "6");
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
     }
 
     #[test]
@@ -265,7 +349,7 @@ pub(crate) mod test {
                 );
                 assert_eq!(model.get_formatted_cell_value(0, 2, 1).unwrap(), "5");
             }
-            converged(&a, &b);
+            converged(&mut a, &mut b);
         }
 
         execute(true);
@@ -278,7 +362,7 @@ pub(crate) mod test {
         a.new_sheet().unwrap();
         a.set_user_input(0, 2, 1, "=SEQUENCE(3)").unwrap(); // A2=1, A3=2, A4=3
         deliver(&mut a, &mut b);
-        converged(&a, &b);
+        converged(&mut a, &mut b);
 
         b.insert_rows(0, 1, 1).unwrap(); // insert row before A1 (which holds array formula)
         deliver(&mut b, &mut a);
@@ -292,7 +376,7 @@ pub(crate) mod test {
                 CellArrayStructure::DynamicAnchor(1, 3)
             );
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
 
         b.delete_rows(0, 3, 1).unwrap(); // delete row which has array formula
         deliver(&mut b, &mut a);
@@ -306,7 +390,7 @@ pub(crate) mod test {
                 );
             }
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
     }
 
     #[test]
@@ -356,7 +440,7 @@ pub(crate) mod test {
                 CellArrayStructure::ArrayChild(1, 1, 1, 3)
             );
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
         b.flush_send_queue();
 
         assert!(b.set_user_input(0, 2, 1, "7").is_err()); // A2=7 (denied)
@@ -374,7 +458,7 @@ pub(crate) mod test {
             }
             assert_eq!(model.get_formatted_cell_value(0, 1, 3).unwrap(), "6");
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
     }
 
     #[test]
@@ -395,7 +479,7 @@ pub(crate) mod test {
                 assert_eq!(model.get_formatted_cell_value(0, 2, 1).unwrap(), "7");
                 assert_eq!(model.get_formatted_cell_value(0, 3, 1).unwrap(), "");
             }
-            converged(&a, &b);
+            converged(&mut a, &mut b);
 
             let (from, to) = if clear_on_author {
                 (&mut a, &mut b)
@@ -409,7 +493,7 @@ pub(crate) mod test {
                 assert_eq!(model.get_formatted_cell_value(0, 2, 1).unwrap(), "20");
                 assert_eq!(model.get_formatted_cell_value(0, 3, 1).unwrap(), "30");
             }
-            converged(&a, &b);
+            converged(&mut a, &mut b);
         }
 
         execute(true);
@@ -459,7 +543,7 @@ pub(crate) mod test {
                 assert_eq!(structure(model, 1, 1), anchor, "array last: {array_last}");
                 assert_eq!(structure(model, 2, 1), below, "array last: {array_last}");
             }
-            converged(&a, &b);
+            converged(&mut a, &mut b);
         }
 
         execute(true);
@@ -518,7 +602,7 @@ pub(crate) mod test {
         a.apply_external_diffs(&from_b).unwrap();
         a.evaluate();
         b.evaluate();
-        converged(&a, &b);
+        converged(&mut a, &mut b);
         for model in [&a, &b] {
             // The array is `height` rows from wherever its anchor sits now.
             assert_eq!(
@@ -640,7 +724,7 @@ pub(crate) mod test {
             // Nothing is locked any more.
             assert_eq!(model.get_cell_content(0, 1, 1).unwrap(), "1");
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
 
         a.redo().unwrap();
         deliver(&mut a, &mut b);
@@ -655,7 +739,7 @@ pub(crate) mod test {
                 CellArrayStructure::ArrayChild(1, 1, 1, 3)
             );
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
         assert!(b.set_user_input(0, 2, 1, "7").is_err()); // locked again
 
         a.undo().unwrap();
@@ -663,7 +747,7 @@ pub(crate) mod test {
         for model in [&a, &b] {
             assert_eq!(a1_to_a4(model), ["1", "2", "3", ""]);
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
     }
 
     #[test]
@@ -685,7 +769,7 @@ pub(crate) mod test {
             assert_eq!(a1_to_a4(model), ["", "7", "", ""]);
             assert_eq!(structure(model, 1, 1), CellArrayStructure::SingleCell);
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
 
         // Redone, the array is back and blocked by the same cell.
         a.redo().unwrap();
@@ -693,7 +777,7 @@ pub(crate) mod test {
         for model in [&a, &b] {
             assert_eq!(a1_to_a4(model), ["#SPILL!", "7", "", ""]);
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
     }
 
     #[test]
@@ -719,7 +803,7 @@ pub(crate) mod test {
                 CellArrayStructure::ArrayChild(1, 1, 1, 3)
             );
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
     }
 
     #[test]
@@ -754,7 +838,7 @@ pub(crate) mod test {
             assert_eq!(a1_to_a4(model), ["1", "2", "3", ""]);
             assert_eq!(structure(model, 1, 1), CellArrayStructure::SingleCell);
         }
-        converged(&a, &b);
+        converged(&mut a, &mut b);
     }
 
     #[test]
@@ -790,8 +874,8 @@ pub(crate) mod test {
                 CellArrayStructure::ArrayChild(2, 1, 1, 3)
             );
         }
-        converged(&a, &b);
-        converged(&a, &c);
+        converged(&mut a, &mut b);
+        converged(&mut a, &mut c);
     }
 
     #[test]
@@ -845,8 +929,8 @@ pub(crate) mod test {
                 assert_eq!(structure(model, 2, 1), below, "down last: {vertical_last}");
                 assert_eq!(structure(model, 1, 2), beside, "down last: {vertical_last}");
             }
-            converged(&a, &b);
-            converged(&a, &c);
+            converged(&mut a, &mut b);
+            converged(&mut a, &mut c);
         }
 
         execute(true);
@@ -871,8 +955,8 @@ pub(crate) mod test {
         a.apply_external_diffs(&from_b).unwrap();
         c.apply_external_diffs(&from_b).unwrap();
         c.apply_external_diffs(&from_a).unwrap();
-        converged(&a, &b);
-        converged(&a, &c);
+        converged(&mut a, &mut b);
+        converged(&mut a, &mut c);
         // Neither holds the other's anchor, so which one gives way is evaluation order — the same
         // on every replica — and exactly one of them does.
         for model in [&a, &b, &c] {
@@ -882,6 +966,76 @@ pub(crate) mod test {
                 (cse == "#SPILL!") != (dynamic == "#SPILL!"),
                 "A2 = {cse}, B1 = {dynamic}"
             );
+        }
+    }
+
+    fn a2(sheet: u32) -> crate::expressions::types::Area {
+        crate::expressions::types::Area {
+            sheet,
+            row: 2,
+            column: 1,
+            width: 1,
+            height: 1,
+        }
+    }
+
+    #[test]
+    fn spill_over_a_styled_empty_cell_keeps_its_style() {
+        let (mut a, mut b) = (peer(1), peer(2));
+        a.new_sheet().unwrap();
+        a.update_range_style(&a2(0), "font.b", "true").unwrap(); // A: A2 bold, empty
+        deliver(&mut a, &mut b);
+        converged(&mut a, &mut b);
+
+        a.set_user_input(0, 1, 1, "=SEQUENCE(3)").unwrap(); // A: A1:A3=1,2,3
+        deliver(&mut a, &mut b);
+        converged(&mut a, &mut b);
+        for model in [&a, &b] {
+            assert_eq!(model.get_formatted_cell_value(0, 2, 1).unwrap(), "2");
+            assert!(model.get_cell_style(0, 2, 1).unwrap().font.b);
+        }
+
+        b.update_range_style(&a2(0), "font.i", "true").unwrap(); // B: A2 italic, spilled
+        deliver(&mut b, &mut a);
+        converged(&mut a, &mut b);
+
+        a.set_user_input(0, 1, 1, "").unwrap(); // A: the spill goes
+        deliver(&mut a, &mut b);
+        converged(&mut a, &mut b);
+        for model in [&a, &b] {
+            let style = model.get_cell_style(0, 2, 1).unwrap();
+            assert!(style.font.b && style.font.i, "A2 is bold and italic");
+            assert_eq!(model.get_formatted_cell_value(0, 2, 1).unwrap(), "");
+        }
+    }
+
+    /// A spill in a styled row shows the row's style, and leaves no cell behind when it goes.
+    #[test]
+    fn spill_in_a_styled_row_leaves_no_cell() {
+        let (mut a, mut b) = (peer(1), peer(2));
+        a.new_sheet().unwrap();
+        let row_2 = crate::expressions::types::Area {
+            sheet: 0,
+            row: 2,
+            column: 1,
+            width: crate::constants::LAST_COLUMN,
+            height: 1,
+        };
+        a.update_range_style(&row_2, "font.b", "true").unwrap(); // A: row 2 bold
+        a.set_user_input(0, 1, 1, "=SEQUENCE(3)").unwrap(); // A: A1:A3=1,2,3
+        deliver(&mut a, &mut b);
+        converged(&mut a, &mut b);
+        for model in [&a, &b] {
+            assert!(model.get_cell_style(0, 2, 1).unwrap().font.b);
+        }
+
+        a.set_user_input(0, 1, 1, "").unwrap(); // A: the spill goes
+        deliver(&mut a, &mut b);
+        converged(&mut a, &mut b);
+        for model in [&a, &b] {
+            let sheet = &model.get_model().workbook.worksheets[0];
+            assert_eq!(sheet.sheet_data.cell(2, 1), None);
+            assert!(model.get_cell_style(0, 2, 1).unwrap().font.b);
         }
     }
 }

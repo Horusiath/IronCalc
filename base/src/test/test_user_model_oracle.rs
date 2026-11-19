@@ -298,13 +298,9 @@ fn redo_relowers_formulas_on_revived_rows() {
 
     c.undo().unwrap(); // clears B1
     c.undo().unwrap(); // clears A5 and deletes row 5's identity
-    let before = c.get_model().local.full_resyncs;
     c.redo().unwrap(); // revives row 5
     c.redo().unwrap(); // restores B1's formula over the revived key
-    assert!(
-        c.get_model().local.full_resyncs > before,
-        "a revival must take the structural resync path"
-    );
+                       // The formula was lowered while row 5 was dead and has to resolve again now.
     assert_eq!(c.get_formatted_cell_value(0, 1, 2).unwrap(), "7");
 
     // The same commits arrive at a peer through `apply`: the revival is caught there too.
@@ -386,7 +382,7 @@ fn snapshot_round_trips_into_a_working_replica() {
 
     // The restoring replica mints under its own session, never the author's.
     let sheet = &restored.get_model().workbook.worksheets[0];
-    let key = <Stable as crate::types::Position>::row_at(&sheet.index, 1).unwrap();
+    let key = Stable::row_at(&sheet.index, 1).unwrap();
     assert_eq!(key.split().1, 2u32.to_be_bytes());
 }
 

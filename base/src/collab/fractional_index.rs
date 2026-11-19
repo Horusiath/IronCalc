@@ -124,18 +124,59 @@ enum Slot {
     Moved(usize),
 }
 
+/// One change to the [FractionalIndex] active order. Positions are active positions valid
+/// at the moment the change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reorder {
+    /// Put `count` new elements `at` given position.
+    Inserted { at: usize, count: usize },
+    /// Remove `count` existing elements `at` given position.
+    Removed { at: usize, count: usize },
+    /// `Vec::remove(from)` followed by `Vec::insert(to)`
+    Moved { from: usize, to: usize },
+}
+
+#[derive(Debug, Default)]
+struct Reorders(Vec<Reorder>);
+
+impl Reorders {
+    /// Appends `change` at the end of the queue,
+    /// possibly merging it with the last entry if possible.
+    fn push(&mut self, change: Reorder) {
+        match (self.0.last_mut(), change) {
+            (Some(Reorder::Inserted { at, count }), Reorder::Inserted { at: next, count: n })
+                if next == *at + *count =>
+            {
+                *count += n;
+            }
+            (Some(Reorder::Removed { at, count }), Reorder::Removed { at: next, count: n })
+                if next + n == *at =>
+            {
+                *at = next;
+                *count += n;
+            }
+            _ => self.0.push(change),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+        self.0.shrink_to(16);
+    }
+}
+
 /// A collection of [FractionalKey]s that enables producing them in a way that matches their desired
 /// order.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct FractionalIndex {
     /// The position record of every visible element, sorted by key.
     active: Vec<Entry>,
     /// Every other record, sorted by key.
     moved: Vec<Entry>,
-
+    /// Event queue keeping all shifts in `active` since the last [`Self::clear_reorders`].
+    reorders: Reorders,
     /// Suffix this replica mints new keys with. Never serialized — see [Self::decode].
     pub suffix: [u8; Self::SESSION_HASH_SIZE],
-
     /// Highest ordinal any [virtual_key] in this index has ever carried, cached rather than stored:
     /// it is exactly `max(virtual_ordinal(k))` over `active ∪ moved`, and it is derivable only
     /// because records are never dropped, so a key that was ever here is still in one of the two
@@ -153,6 +194,18 @@ impl PartialEq for FractionalIndex {
 }
 impl Eq for FractionalIndex {}
 
+impl Clone for FractionalIndex {
+    fn clone(&self) -> Self {
+        FractionalIndex {
+            active: self.active.clone(),
+            moved: self.moved.clone(),
+            reorders: Reorders::default(), // we don't clone event queue
+            suffix: self.suffix,
+            watermark: self.watermark,
+        }
+    }
+}
+
 impl FractionalIndex {
     const SESSION_HASH_SIZE: usize = SESSION_SUFFIX_LEN;
 
@@ -168,9 +221,19 @@ impl FractionalIndex {
         FractionalIndex {
             active,
             moved,
+            reorders: Reorders::default(),
             suffix,
             watermark,
         }
+    }
+
+    /// The changes to the active order since the last [`Self::clear_reorders`].
+    pub fn reorders(&self) -> &[Reorder] {
+        &self.reorders.0
+    }
+
+    pub fn clear_reorders(&mut self) {
+        self.reorders.clear();
     }
 
     fn max_virtual_ordinal(entries: &[Entry]) -> u32 {
@@ -266,6 +329,18 @@ impl FractionalIndex {
 
     /// The active index of the element `key` names, `None` when it is hidden.
     pub fn position_of(&self, key: &FractionalKey) -> Option<usize> {
+        if let Some(n) = virtual_ordinal(key) {
+            // fast path - decoding virtual fractional key may give direct index right away
+            let at = n as usize - 1;
+            if self
+                .active
+                .get(at)
+                // have we found the correct key?
+                .is_some_and(|e| e.key == *key && e.moved().is_none())
+            {
+                return Some(at);
+            }
+        }
         match self.resolve(key)?.1 {
             Slot::Active(i) => Some(i),
             Slot::Moved(_) => None,
@@ -335,6 +410,8 @@ impl FractionalIndex {
 
     /// Raises `identity`'s touch stamp; `identity` must be an identity key. Returns whether that
     /// changed its visibility, and its removal stamp (zero for an unknown key).
+    ///
+    /// A change of visibility is queued in [FractionalIndex::reorders].
     pub(crate) fn touch(&mut self, identity: &FractionalKey, at: Hlc) -> (bool, Hlc) {
         let Some(slot) = self.find(identity) else {
             return (false, Hlc::new(0));
@@ -441,10 +518,13 @@ impl FractionalIndex {
         for (identity, dest) in self.plan_move(source, dest) {
             self.apply_move(&identity, dest, at);
         }
+        self.reorders.clear(); // nobody reads the reorder results of this method call
     }
 
     pub fn remove_key(&mut self, key: &FractionalKey) -> Option<FractionalKey> {
-        self.remove_key_at(key, Hlc::now())
+        let removed = self.remove_key_at(key, Hlc::now());
+        self.reorders.clear(); // nobody reads the reorder results of this method call
+        removed
     }
 
     /// [`Self::remove_key_at`] for each of `keys`.
@@ -469,7 +549,11 @@ impl FractionalIndex {
         }
         let deactivated = hidden.iter().map(|&i| self.active[i].clone()).collect();
         Self::remove_all(&mut self.active, &hidden);
-        Self::insert_all(&mut self.moved, deactivated);
+        // Descending, so each position is still valid once the ones after it are gone.
+        for &i in hidden.iter().rev() {
+            self.reorders.push(Reorder::Removed { at: i, count: 1 });
+        }
+        Self::insert_all(&mut self.moved, deactivated, |_| {});
         for key in rest {
             self.remove_key_at(key, at);
         }
@@ -481,6 +565,8 @@ impl FractionalIndex {
     /// Raises the element's tombstone; its position register is left alone, so an insert or
     /// move newer than `at` puts it back where it last was. Returns the identity it answered to
     /// when this hid the element, `None` otherwise.
+    ///
+    /// A change of visibility is queued in [FractionalIndex::reorders].
     pub fn remove_key_at(&mut self, key: &FractionalKey, at: Hlc) -> Option<FractionalKey> {
         let Some((slot, _)) = self.resolve(key) else {
             // Kept until the insert arrives, so the removal still outranks older writes.
@@ -546,7 +632,9 @@ impl FractionalIndex {
     /// strictly newer than the write it races — so a delete wins over a concurrent insert of the
     /// same key, and redelivery of the original insert cannot resurrect.
     pub fn insert_key(&mut self, key: FractionalKey) -> Option<usize> {
-        self.insert_key_at(key, Hlc::now())
+        let inserted = self.insert_key_at(key, Hlc::now());
+        self.reorders.clear(); // nobody reads the reorder results of this method call
+        inserted
     }
 
     /// [`Self::insert_key`] stamping `at` instead of reading the local clock — see
@@ -554,6 +642,8 @@ impl FractionalIndex {
     ///
     /// An insert of a key this index has seen is a move of its element onto it: it undoes a removal,
     /// and it takes the element back from a destination an older move sent it to.
+    ///
+    /// A change of visibility is queued in [FractionalIndex::reorders].
     pub fn insert_key_at(&mut self, key: FractionalKey, at: Hlc) -> Option<usize> {
         // Before the ever-seen check: a rejected key was still handed out, and its ordinal must not
         // be minted again.
@@ -566,6 +656,10 @@ impl FractionalIndex {
                 let index = self.active_index(&key);
                 self.active
                     .insert(index, Entry::new(key, at, FractionalKey::NULL));
+                self.reorders.push(Reorder::Inserted {
+                    at: index,
+                    count: 1,
+                });
                 Some(index)
             }
             Some((slot, position)) => {
@@ -580,6 +674,8 @@ impl FractionalIndex {
 
     /// [`Self::insert_key_at`] for each of `keys`. Returns whether any of them put back an element
     /// this index had already seen (a revive).
+    ///
+    /// A change of visibility is queued in [FractionalIndex::reorders].
     pub fn insert_keys_at(&mut self, keys: &[FractionalKey], at: Hlc) -> bool {
         let (mut fresh, mut seen) = (Vec::new(), Vec::new());
         for key in keys {
@@ -598,7 +694,17 @@ impl FractionalIndex {
             .into_iter()
             .map(|key| Entry::new(key.clone(), at, FractionalKey::NULL))
             .collect();
-        Self::insert_all(&mut self.active, entries);
+        let mut buf: Vec<Reorder> = Vec::new();
+        Self::insert_all(&mut self.active, entries, |i| match buf.last_mut() {
+            Some(Reorder::Inserted { at, count }) if i + 1 == *at => {
+                *at = i;
+                *count += 1;
+            }
+            _ => buf.push(Reorder::Inserted { at: i, count: 1 }),
+        });
+        for run in buf.into_iter().rev() {
+            self.reorders.push(run);
+        }
         let mut revived = false;
         for key in seen {
             revived |= self.insert_key_at(key.clone(), at).is_some();
@@ -612,6 +718,8 @@ impl FractionalIndex {
     ///
     /// Concurrent moves of one element order by `(at, dest)`; the loser's `dest` is still filed as a
     /// position the element passed through, keeping both peers' `moved` spaces identical.
+    ///
+    /// A change of visibility is queued in [FractionalIndex::reorders].
     pub fn apply_move(&mut self, source: &FractionalKey, dest: FractionalKey, at: Hlc) {
         let Some((slot, position)) = self.resolve(source) else {
             return; // a key this index has never seen
@@ -622,6 +730,8 @@ impl FractionalIndex {
     /// Writes `{at → dest}` (null for its own key) into the identity record at `id`, files `dest` as
     /// a position it names win or lose, and moves `position` out of `active` if it lost its place.
     /// Every insert and move is this one join. Returns the active index if it won and is visible.
+    ///
+    /// A change of visibility is queued in [FractionalIndex::reorders].
     fn write_position(
         &mut self,
         id: Slot,
@@ -668,6 +778,7 @@ impl FractionalIndex {
         let k = k.unwrap_or_else(|| self.active_index(&new.key)); //TODO: should it even happen?
         let Slot::Active(i) = position else {
             self.active.insert(k, new);
+            self.reorders.push(Reorder::Inserted { at: k, count: 1 });
             return Some(k);
         };
         // The old position leaves `active` as the new one enters: one shift of the span between.
@@ -679,6 +790,10 @@ impl FractionalIndex {
             self.active[k..=i].rotate_right(1);
             k
         };
+        // A new key sorting into the old one's place changes the key, not the order.
+        if k != i {
+            self.reorders.push(Reorder::Moved { from: i, to: k });
+        }
         self.insert_moved(old);
         Some(k)
     }
@@ -708,6 +823,7 @@ impl FractionalIndex {
             return false;
         };
         let e = self.active.remove(i);
+        self.reorders.push(Reorder::Removed { at: i, count: 1 });
         self.insert_moved(e);
         true
     }
@@ -720,6 +836,7 @@ impl FractionalIndex {
         let e = self.moved.remove(j);
         let i = self.active_index(&e.key);
         self.active.insert(i, e);
+        self.reorders.push(Reorder::Inserted { at: i, count: 1 });
         true
     }
 
@@ -795,8 +912,9 @@ impl FractionalIndex {
     }
 
     /// Merges `entries` — ascending by key, none of them already filed — into `space` from the back,
-    /// so each entry already there moves at most once.
-    fn insert_all(space: &mut Vec<Entry>, mut entries: Vec<Entry>) {
+    /// so each entry already there moves at most once. `placed` gets each entry's final index, in
+    /// descending order.
+    fn insert_all(space: &mut Vec<Entry>, mut entries: Vec<Entry>, mut placed: impl FnMut(usize)) {
         if entries.is_empty() {
             return;
         }
@@ -812,6 +930,7 @@ impl FractionalIndex {
             }
             write -= 1;
             space[write] = e;
+            placed(write);
         }
     }
 
@@ -832,6 +951,8 @@ impl FractionalIndex {
     /// costs nothing beyond each table's own entry count. See [codec](crate::collab::codec) for the
     /// layout and for why an index is worth encoding by column rather than by entry.
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        debug_assert!(self.reorders.0.is_empty(), "reorders were not consumed");
+
         let mut out = Vec::new();
         out.push(FORMAT_VERSION);
         encode_entries(&self.active, &mut out)?;
@@ -1139,9 +1260,10 @@ mod test {
     #![allow(clippy::unwrap_used)]
     use super::{
         gap_capacity, virtual_key, virtual_ordinal, Entry, FractionalIndex, FractionalKey, Hlc,
-        Slot,
+        Reorder, Slot,
     };
     use std::collections::HashSet;
+    use std::ops::Deref;
 
     /// The identity of every entry, in stored order. An identity is stable per element across a
     /// `move_to`, so this tracks element movement *within* a single [FractionalIndex].
@@ -1167,12 +1289,227 @@ mod test {
 
     /// An index of `count` virtual keys, all stamped `at(1)`.
     fn virtual_index(count: u32) -> (FractionalIndex, Vec<FractionalKey>) {
-        let mut fi = FractionalIndex::new(vec![], vec![], [b'a', 0, 0, 0]);
+        let (t, keys) = tracked(count);
+        (t.fi, keys)
+    }
+
+    /// [`virtual_index`], tracked.
+    fn tracked(count: u32) -> (Tracked, Vec<FractionalKey>) {
+        let mut t = Tracked::new(FractionalIndex::new(vec![], vec![], [b'a', 0, 0, 0]));
         let keys: Vec<FractionalKey> = (1..=count).map(virtual_key).collect();
         for key in &keys {
-            fi.insert_key_at(key.clone(), at(1));
+            t.insert_key_at(key.clone(), at(1));
         }
-        (fi, keys)
+        (t, keys)
+    }
+
+    /// Track what fractional keys did [FractionalIndex::reorders] pointed to and tries to mirror
+    /// its state based on [Reorder] events alone.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Tracked {
+        fi: FractionalIndex,
+        mirror: Vec<FractionalKey>,
+    }
+
+    impl Deref for Tracked {
+        type Target = FractionalIndex;
+
+        fn deref(&self) -> &FractionalIndex {
+            &self.fi
+        }
+    }
+
+    impl Tracked {
+        fn new(fi: FractionalIndex) -> Self {
+            let mirror = identity_order(&fi);
+            Tracked { fi, mirror }
+        }
+
+        fn insert_key_at(&mut self, key: FractionalKey, at: Hlc) -> Option<usize> {
+            let result = self.fi.insert_key_at(key, at);
+            self.follow();
+            result
+        }
+
+        fn insert_keys_at(&mut self, keys: &[FractionalKey], at: Hlc) -> bool {
+            let result = self.fi.insert_keys_at(keys, at);
+            self.follow();
+            result
+        }
+
+        fn remove_key_at(&mut self, key: &FractionalKey, at: Hlc) -> Option<FractionalKey> {
+            let result = self.fi.remove_key_at(key, at);
+            self.follow();
+            result
+        }
+
+        fn remove_keys_at(&mut self, keys: &[FractionalKey], at: Hlc) {
+            self.fi.remove_keys_at(keys, at);
+            self.follow();
+        }
+
+        fn apply_move(&mut self, source: &FractionalKey, dest: FractionalKey, at: Hlc) {
+            self.fi.apply_move(source, dest, at);
+            self.follow();
+        }
+
+        fn touch(&mut self, identity: &FractionalKey, at: Hlc) -> (bool, Hlc) {
+            let result = self.fi.touch(identity, at);
+            self.follow();
+            result
+        }
+
+        /// Replays the queued changes onto the mirror, in order, and checks it against the index.
+        fn follow(&mut self) {
+            let mut next: Vec<Option<FractionalKey>> = self.mirror.drain(..).map(Some).collect();
+            for &change in self.fi.reorders() {
+                match change {
+                    Reorder::Inserted { at, count } => {
+                        next.splice(at..at, std::iter::repeat_n(None, count));
+                    }
+                    Reorder::Removed { at, count } => {
+                        next.drain(at..at + count);
+                    }
+                    Reorder::Moved { from, to } => {
+                        let e = next.remove(from);
+                        next.insert(to, e);
+                    }
+                }
+            }
+            self.fi.clear_reorders();
+            let view = identity_order(&self.fi);
+            assert_eq!(next.len(), view.len(), "mirror length diverged");
+            // An inserted element is new to the mirror: its identity is read off where it ended
+            // up, which a later change in the same operation may have shifted.
+            self.mirror = (next.into_iter().zip(&view))
+                .map(|(mirrored, key)| mirrored.unwrap_or_else(|| key.clone()))
+                .collect();
+            assert_eq!(self.mirror, view, "mirror diverged");
+        }
+    }
+
+    /// One replicated write, as a patch carries it.
+    #[derive(Clone, Debug)]
+    enum Op {
+        Remove(FractionalKey, Hlc),
+        RemoveMany(Vec<FractionalKey>, Hlc),
+        Insert(FractionalKey, Hlc),
+        InsertMany(Vec<FractionalKey>, Hlc),
+        Move(FractionalKey, FractionalKey, Hlc),
+        Touch(FractionalKey, Hlc),
+    }
+
+    fn apply(t: &mut Tracked, op: &Op) {
+        match op {
+            Op::Remove(key, at) => {
+                t.remove_key_at(key, *at);
+            }
+            Op::RemoveMany(keys, at) => t.remove_keys_at(keys, *at),
+            Op::Insert(key, at) => {
+                t.insert_key_at(key.clone(), *at);
+            }
+            Op::InsertMany(keys, at) => {
+                t.insert_keys_at(keys, *at);
+            }
+            Op::Move(source, dest, at) => t.apply_move(source, dest.clone(), *at),
+            Op::Touch(key, at) => {
+                t.touch(key, *at);
+            }
+        }
+    }
+
+    fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        if items.is_empty() {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for i in 0..items.len() {
+            let mut rest = items.to_vec();
+            let head = rest.remove(i);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, head.clone());
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    /// xorshift64: deterministic, so a failing run replays.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+
+        fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+            &items[self.below(items.len())]
+        }
+    }
+
+    /// Keys a random op may name: `ids` are identities, which may be moved and touched; `known`
+    /// may be inserted and removed.
+    struct Pool {
+        ids: Vec<FractionalKey>,
+        known: Vec<FractionalKey>,
+    }
+
+    /// Random writes planned against `fi`, one stamp for all of them, drawn from a small range so
+    /// that racing writes lose as well as win. Also returns the keys it minted as identities and
+    /// the move destinations it minted.
+    fn fuzz(
+        rng: &mut Rng,
+        fi: &FractionalIndex,
+        pool: &Pool,
+    ) -> (Vec<Op>, Vec<FractionalKey>, Vec<FractionalKey>) {
+        let stamp = at(1 + rng.below(24) as u64);
+        let len = fi.len();
+        let (mut fresh, mut dests) = (Vec::new(), Vec::new());
+        let ops = match rng.below(7) {
+            0 => {
+                // Fresh keys, one or a run, now and then with a seen one in the same batch.
+                let mut keys = fi.plan_insert(rng.below(len + 1), 1 + rng.below(3));
+                fresh.extend(keys.iter().cloned());
+                if keys.len() == 1 && rng.below(2) == 0 {
+                    vec![Op::Insert(keys.remove(0), stamp)]
+                } else {
+                    if rng.below(2) == 0 {
+                        keys.push(rng.pick(&pool.known).clone());
+                    }
+                    vec![Op::InsertMany(keys, stamp)]
+                }
+            }
+            1 => vec![Op::Insert(rng.pick(&pool.known).clone(), stamp)],
+            2 => vec![Op::Remove(rng.pick(&pool.known).clone(), stamp)],
+            3 => {
+                let n = 1 + rng.below(3);
+                let keys = (0..n).map(|_| rng.pick(&pool.known).clone()).collect();
+                vec![Op::RemoveMany(keys, stamp)]
+            }
+            4 if len > 0 => {
+                let start = rng.below(len);
+                let end = start + 1 + rng.below((len - start).min(3));
+                let plan = fi.plan_move(start..end, rng.below(len + 1));
+                (plan.into_iter())
+                    .filter(|(source, _)| pool.ids.contains(source))
+                    .map(|(source, dest)| {
+                        dests.push(dest.clone());
+                        Op::Move(source, dest, stamp)
+                    })
+                    .collect()
+            }
+            5 => vec![Op::Touch(rng.pick(&pool.ids).clone(), stamp)],
+            _ => {
+                // A removal arriving ahead of the insert it races.
+                let keys = fi.plan_insert(rng.below(len + 1), 1);
+                fresh.extend(keys.iter().cloned());
+                keys.into_iter().map(|key| Op::Remove(key, stamp)).collect()
+            }
+        };
+        (ops, fresh, dests)
     }
 
     /// `moved` records no active entry's chain reaches: exactly the removed elements' records.
@@ -1186,7 +1523,7 @@ mod test {
 
     #[test]
     fn plan_insert_past_the_tail() {
-        let (mut fi, keys) = virtual_index(2); // [v1, v2]
+        let (mut fi, keys) = tracked(2); // [v1, v2]
         let ordinals = |keys: &[FractionalKey]| -> Vec<Option<u32>> {
             keys.iter().map(virtual_ordinal).collect()
         };
@@ -1223,7 +1560,7 @@ mod test {
     /// it was, and nothing stamped before it does.
     #[test]
     fn undo_remove() {
-        let (mut fi, keys) = virtual_index(3);
+        let (mut fi, keys) = tracked(3);
         assert_eq!(fi.remove_key_at(&keys[1], at(10)), Some(keys[1].clone()));
         assert_eq!(identity_order(&fi), vec![keys[0].clone(), keys[2].clone()]);
         assert_eq!(fi.position_of(&keys[1]), None);
@@ -1253,7 +1590,7 @@ mod test {
     /// before, and a concurrent move settles by `(at, dest)` whichever order the two arrive in.
     #[test]
     fn undo_move() {
-        let (mut fi, keys) = virtual_index(3);
+        let (mut fi, keys) = tracked(3);
         let identity = keys[0].clone();
         let d1 = fi.create_keys(2, 1).next().unwrap(); // between the second and third
         let d2 = fi.create_keys(3, 1).next().unwrap(); // past the end
@@ -1310,7 +1647,7 @@ mod test {
     /// reach a replica in, it has to end on the same records and the same readout.
     #[test]
     fn remove_move_races_commute() {
-        let (fi, keys) = virtual_index(3);
+        let (fi, keys) = tracked(3);
         let k = keys[1].clone();
         let d = fi.create_keys(3, 1).next().unwrap(); // a destination a peer minted
 
@@ -1345,7 +1682,7 @@ mod test {
     /// identity — so every key on a dead chain has to lead back to the same element.
     #[test]
     fn held_key_addressing_after_remove() {
-        let (mut fi, keys) = virtual_index(2);
+        let (mut fi, keys) = tracked(2);
         let k = keys[0].clone();
         let d = fi.create_keys(2, 1).next().unwrap();
         fi.apply_move(&k, d.clone(), at(10));
@@ -1364,7 +1701,7 @@ mod test {
         assert_eq!(fi.position_of(&k), fi.position_of(&d));
 
         // The same, two hops along: the removal names the last of them.
-        let (mut fi, keys) = virtual_index(3);
+        let (mut fi, keys) = tracked(3);
         let identity = keys[0].clone();
         let d1 = fi.create_keys(2, 1).next().unwrap();
         let d2 = fi.create_keys(3, 1).next().unwrap();
@@ -1389,45 +1726,6 @@ mod test {
     /// orders someone thought of; this one checks every order of a racing set.
     #[test]
     fn ops_commute_in_all_orders() {
-        #[derive(Clone, Debug)]
-        enum Op {
-            Remove(FractionalKey, Hlc),
-            Insert(FractionalKey, Hlc),
-            Move(FractionalKey, FractionalKey, Hlc),
-            Touch(FractionalKey, Hlc),
-        }
-
-        fn apply(fi: &mut FractionalIndex, op: &Op) {
-            match op {
-                Op::Remove(key, at) => {
-                    fi.remove_key_at(key, *at);
-                }
-                Op::Insert(key, at) => {
-                    fi.insert_key_at(key.clone(), *at);
-                }
-                Op::Move(source, dest, at) => fi.apply_move(source, dest.clone(), *at),
-                Op::Touch(key, at) => {
-                    fi.touch(key, *at);
-                }
-            }
-        }
-
-        fn permutations(ops: &[Op]) -> Vec<Vec<Op>> {
-            if ops.is_empty() {
-                return vec![Vec::new()];
-            }
-            let mut out = Vec::new();
-            for i in 0..ops.len() {
-                let mut rest = ops.to_vec();
-                let head = rest.remove(i);
-                for mut tail in permutations(&rest) {
-                    tail.insert(0, head.clone());
-                    out.push(tail);
-                }
-            }
-            out
-        }
-
         /// Applies `ops` in every order; each must land on the same records, touch stamps and
         /// readout.
         fn settle(base: &FractionalIndex, ops: &[Op]) -> (FractionalIndex, Vec<FractionalKey>) {
@@ -1440,10 +1738,11 @@ mod test {
             };
             let mut expected: Option<(FractionalIndex, Vec<FractionalKey>)> = None;
             for order in permutations(ops) {
-                let mut fi = base.clone();
+                let mut t = Tracked::new(base.clone());
                 for op in &order {
-                    apply(&mut fi, op);
+                    apply(&mut t, op);
                 }
+                let fi = t.fi;
                 let readout = identity_order(&fi);
                 match &expected {
                     None => expected = Some((fi, readout)),
@@ -1504,7 +1803,7 @@ mod test {
     /// an insert of that destination newer than the removal puts it back there.
     #[test]
     fn removal_keeps_the_pointer() {
-        let (mut fi, keys) = virtual_index(3);
+        let (mut fi, keys) = tracked(3);
         let identity = keys[0].clone();
         let d = fi.create_keys(3, 1).next().unwrap(); // past the end
         fi.apply_move(&identity, d.clone(), at(10));
@@ -1514,10 +1813,12 @@ mod test {
         // Both records are in `moved` space and point at each other; either key finds the
         // identity's record.
         for key in [&identity, &d] {
-            let Some((Slot::Moved(j), _)) = fi.resolve(key) else {
-                panic!("{key:?} resolves outside `moved` space");
-            };
-            assert_eq!(fi.moved[j].key, identity);
+            let slot = fi.resolve(key).map(|(slot, _)| slot);
+            assert!(
+                matches!(slot, Some(Slot::Moved(_))),
+                "{key:?} resolves outside `moved` space"
+            );
+            assert_eq!(fi.entry(slot.unwrap()).key, identity);
             assert_eq!(fi.entry_by_key(key).map(|e| &e.key), Some(&identity));
         }
         assert_eq!(removed_at(&fi, &d), Some(at(20)));
@@ -1535,7 +1836,7 @@ mod test {
     /// newer removal hides it again.
     #[test]
     fn touch_shows_a_removed_element() {
-        let (mut fi, keys) = virtual_index(3);
+        let (mut fi, keys) = tracked(3);
         let key = &keys[1];
         let hidden = vec![keys[0].clone(), keys[2].clone()];
         fi.remove_key_at(key, at(10));
@@ -1556,7 +1857,7 @@ mod test {
     /// `touched_at` is not encoded: a decoded index has none, and equals the original anyway.
     #[test]
     fn encode_drops_touched_at_and_keeps_removed_at() {
-        let (mut fi, keys) = virtual_index(3);
+        let (mut fi, keys) = tracked(3);
         let d = fi.create_keys(3, 1).next().unwrap();
         fi.apply_move(&keys[0], d, at(10));
         fi.remove_key_at(&keys[0], at(20));
@@ -1565,7 +1866,7 @@ mod test {
         fi.touch(&keys[2], at(40));
 
         let decoded = FractionalIndex::decode(&fi.encode().unwrap(), fi.suffix).unwrap();
-        assert_eq!(decoded, fi);
+        assert_eq!(decoded, fi.fi);
         assert_eq!(identity_order(&decoded), identity_order(&fi));
         let all = |fi: &FractionalIndex| {
             fi.active
@@ -1585,7 +1886,7 @@ mod test {
     /// A removed element's records are the ones no key resolves to an active position through.
     #[test]
     fn removed_means_unreachable() {
-        let (mut fi, keys) = virtual_index(3);
+        let (mut fi, keys) = tracked(3);
         let d = fi.create_keys(3, 1).next().unwrap();
 
         fi.apply_move(&keys[0], d.clone(), at(10));
@@ -1751,8 +2052,12 @@ mod test {
     fn concurrent_move_of_same_element_converges() {
         // Shared initial list [k0 k1 k2]; distinct session suffixes, so the peers never mint
         // colliding keys.
-        let (mut a, keys) = virtual_index(3);
-        let mut b = FractionalIndex::new(a.active.clone(), vec![], [b'b', 0, 0, 0]);
+        let (mut a, keys) = tracked(3);
+        let mut b = Tracked::new(FractionalIndex::new(
+            a.active.clone(),
+            vec![],
+            [b'b', 0, 0, 0],
+        ));
         let [k0, k1, k2] = [&keys[0], &keys[1], &keys[2]];
 
         // Both concurrently move k1: A to the end, B (newer) to the front.
@@ -1951,7 +2256,7 @@ mod test {
     /// in, the loser leaves the same record behind.
     #[test]
     fn concurrent_moves_apply_in_both_orders() {
-        let (fi, keys) = virtual_index(3);
+        let (fi, keys) = tracked(3);
         let mut gen = fi.create_keys(3, 2);
         let (d1, d2) = (gen.next().unwrap(), gen.next().unwrap());
         drop(gen);
@@ -1965,5 +2270,67 @@ mod test {
         assert_eq!(x.position_of(&i), Some(2));
         assert_eq!(x.get(2).unwrap().key, d2);
         assert_eq!(x.position_of(&d1), Some(2));
+    }
+
+    #[test]
+    fn fuzz_ops_report_their_orders() {
+        let seed = Hlc::now().get();
+        let mut rng = Rng(seed);
+        let (mut t, keys) = tracked(8);
+        let mut pool = Pool {
+            ids: keys.clone(),
+            known: keys,
+        };
+        for _ in 0..400 {
+            let (ops, fresh, dests) = fuzz(&mut rng, &t, &pool);
+            for op in &ops {
+                apply(&mut t, op);
+            }
+            pool.ids.extend(fresh.iter().cloned());
+            pool.known.extend(fresh);
+            pool.known.extend(dests);
+        }
+    }
+
+    #[test]
+    fn fuzz_ops_converge_in_any_order() {
+        let seed = Hlc::now().get();
+        let mut rng = Rng(seed);
+        for round in 0..100 {
+            let (base, keys) = virtual_index(5);
+            let mut pool = Pool {
+                ids: keys.clone(),
+                known: keys,
+            };
+            let mut author = Tracked::new(base.clone());
+            let mut ops = Vec::new();
+            while ops.len() < 6 {
+                let (batch, fresh, _) = fuzz(&mut rng, &author, &pool);
+                for op in &batch {
+                    apply(&mut author, op);
+                }
+                pool.known.extend(fresh);
+                ops.extend(batch);
+            }
+            ops.truncate(6);
+            let orders = permutations(&ops);
+            let picks = [0, orders.len() - 1, 1 + rng.below(orders.len() - 2)];
+            let replicas: Vec<Tracked> = (picks.iter())
+                .map(|&p| {
+                    let mut t = Tracked::new(base.clone());
+                    for op in &orders[p] {
+                        apply(&mut t, op);
+                    }
+                    t
+                })
+                .collect();
+            for (p, replica) in picks.iter().zip(&replicas).skip(1) {
+                assert_eq!(
+                    replica.fi, replicas[0].fi,
+                    "round {round} diverged: {:?} vs {:?}",
+                    orders[*p], orders[picks[0]]
+                );
+            }
+        }
     }
 }

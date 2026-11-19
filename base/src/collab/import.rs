@@ -1,27 +1,19 @@
 use std::collections::HashMap;
 
-use crate::cf_types::ConditionalFormatting;
 use crate::collab::bind::MintPlan;
-use crate::collab::fractional_index::{
-    virtual_key, FractionalIndex, FractionalKey, KeyBuf, SESSION_SUFFIX_LEN,
-};
+use crate::collab::fractional_index::{virtual_key, FractionalKey, KeyBuf, SESSION_SUFFIX_LEN};
 use crate::collab::log::SessionId;
-use crate::collab::model::{CollabModel, Stable, StableRange};
+use crate::collab::model::{CollabModel, CommentBody, Stable, StableRange};
 use crate::collab::patch::{
     CellInput, CfProperty, ColState, ConditionalFormatState, NamedStyleId, Patch, RowState,
     SheetContent, SheetIndexSeed, StableCfRule,
 };
-use crate::constants::LAST_COLUMN;
 use crate::expressions::lexer::LexerMode;
-use crate::expressions::parser::stringify::to_rc_format;
 use crate::expressions::parser::Node;
 use crate::expressions::types::CellReferenceRC;
 use crate::language::get_default_language;
 use crate::locale::get_default_locale;
-use crate::types::{
-    ArrayKind, Cell, Col, Comment, MergedCell, Ordinal, Position, RangeRef, Row, SheetData,
-    StyleIncludes, Styles, Workbook, Worksheet,
-};
+use crate::types::{ArrayKind, Cell, RangeRef, StyleIncludes, Styles, Workbook, Worksheet};
 
 /// How far the sheet reaches on each axis.
 pub(crate) fn used_extent(ws: &Worksheet) -> (i32, i32) {
@@ -197,14 +189,17 @@ pub(crate) fn content_from_ordinal(
         comments: ws
             .comments
             .iter()
-            .map(|c| Comment {
-                text: c.text.clone(),
-                author_name: c.author_name.clone(),
-                author_id: c.author_id.clone(),
-                cell_ref: (
+            .map(|c| {
+                let at = (
                     virtual_key(c.cell_ref.0 as u32),
                     virtual_key(c.cell_ref.1 as u32),
-                ),
+                );
+                let body = CommentBody {
+                    text: c.text.clone(),
+                    author_name: c.author_name.clone(),
+                    author_id: c.author_id.clone(),
+                };
+                (at, body)
             })
             .collect(),
         conditional_formatting: ws
@@ -424,8 +419,7 @@ impl CollabModel<'_> {
             .workbook
             .worksheets
             .iter()
-            .enumerate()
-            .map(|(at, ws)| self.project_sheet(at, ws))
+            .map(|ws| self.project_sheet(ws))
             .collect();
         Workbook {
             shared_strings: self.workbook.shared_strings.clone(),
@@ -441,146 +435,24 @@ impl CollabModel<'_> {
         }
     }
 
-    fn project_sheet(&self, at: usize, ws: &Worksheet<Stable>) -> Worksheet {
-        /// Map fractional index keys back to their ordinal position.
-        fn ordinals(axis: &FractionalIndex) -> HashMap<FractionalKey, i32> {
-            axis.view()
-                .enumerate()
-                .map(|(i, key)| (key.clone(), i as i32 + 1))
-                .collect()
-        }
-        let (rows, cols) = (ordinals(&ws.index.rows), ordinals(&ws.index.cols));
-        let row = |k: &FractionalKey| rows.get(k).copied();
-        let col = |k: &FractionalKey| cols.get(k).copied();
-        // Corners are mapped, not re-normalized: see `test_stable_projection`.
-        let range = |r: &StableRange| -> Option<RangeRef> {
-            let rows = match &r.rows {
-                Some((lo, hi)) => Some((row(lo)?, row(hi)?)),
-                None => None,
-            };
-            let cols = match &r.cols {
-                Some((lo, hi)) => Some((col(lo)?, col(hi)?)),
-                None => None,
-            };
-            Some(RangeRef { rows, cols })
-        };
-
-        // The formula table is rebuilt as we go: a cell's stream is written back as R1C1 and
-        // interned, so the indices the cells carry are the ones this table hands out.
-        let mut shared_formulas: Vec<String> = Vec::new();
-        let mut sheet_data = SheetData::<Ordinal>::default();
-        for (row_key, cells) in ws.sheet_data.rows() {
-            let Some(r) = row(row_key) else { continue };
-            for (c, cell) in cells {
-                let Some(c) = col(c) else { continue };
-                let cell = match cell.get_formula() {
-                    Some(f) => {
-                        let Some(node) = Stable::materialize_formula(self, at as u32, r, c, f)
-                        else {
-                            continue;
-                        };
-                        let text = to_rc_format(&node);
-                        let f = match shared_formulas.iter().position(|s| s == &text) {
-                            Some(f) => f as i32,
-                            None => {
-                                shared_formulas.push(text);
-                                shared_formulas.len() as i32 - 1
-                            }
-                        };
-                        match cell.clone() {
-                            Cell::CellFormula { s, v, .. } => Cell::CellFormula { f, s, v },
-                            Cell::ArrayFormula { s, r, kind, v, .. } => {
-                                Cell::ArrayFormula { f, s, r, kind, v }
-                            }
-                            other => other,
-                        }
-                    }
-                    None => cell.clone(),
-                };
-                sheet_data.set_cell(r, c, cell);
-            }
-        }
-
+    fn project_sheet(&self, ws: &Worksheet<Stable>) -> Worksheet {
         Worksheet {
             dimension: ws.dimension.clone(),
-            // An open corner is the axis' extreme; ordinal addressing has no sentinel for it.
-            cols: ws
-                .cols
-                .iter()
-                .filter_map(|c| {
-                    let min = match c.min.is_empty() {
-                        true => 1,
-                        false => col(&c.min)?,
-                    };
-                    let max = match c.max.is_empty() {
-                        true => LAST_COLUMN,
-                        false => col(&c.max)?,
-                    };
-                    Some(Col {
-                        min,
-                        max,
-                        width: c.width,
-                        custom_width: c.custom_width,
-                        hidden: c.hidden,
-                        style: c.style,
-                    })
-                })
-                .collect(),
-            rows: ws
-                .rows
-                .iter()
-                .filter_map(|r| {
-                    Some(Row {
-                        r: row(&r.r)?,
-                        height: r.height,
-                        custom_format: r.custom_format,
-                        custom_height: r.custom_height,
-                        s: r.s,
-                        hidden: r.hidden,
-                    })
-                })
-                .collect(),
+            cols: ws.cols.clone(),
+            rows: ws.rows.clone(),
             name: ws.name.clone(),
-            sheet_data,
-            shared_formulas,
+            sheet_data: ws.sheet_data.clone(),
+            shared_formulas: ws.shared_formulas.clone(),
             sheet_id: ws.sheet_id,
             state: ws.state.clone(),
             color: ws.color.clone(),
-            merged_cells: ws
-                .merged_cells
-                .iter()
-                .filter_map(&range)
-                .map(|r| MergedCell::from(&r))
-                .collect(),
-            comments: ws
-                .comments
-                .iter()
-                .filter_map(|c| {
-                    Some(Comment {
-                        text: c.text.clone(),
-                        author_name: c.author_name.clone(),
-                        author_id: c.author_id.clone(),
-                        cell_ref: (row(&c.cell_ref.0)?, col(&c.cell_ref.1)?),
-                    })
-                })
-                .collect(),
-            links: ws
-                .links
-                .iter()
-                .filter_map(|((r, c), link)| Some(((row(r)?, col(c)?), self.link_view(link))))
-                .collect(),
+            merged_cells: ws.merged_cells.clone(),
+            comments: ws.comments.clone(),
+            links: ws.links.clone(),
             frozen_rows: ws.frozen_rows,
             frozen_columns: ws.frozen_columns,
             show_grid_lines: ws.show_grid_lines,
-            conditional_formatting: ws
-                .conditional_formatting
-                .iter()
-                .map(|cf| ConditionalFormatting {
-                    ranges: cf.ranges.iter().filter_map(&range).collect(),
-                    cf_rule: cf.cf_rule.clone(),
-                    priority: cf.priority,
-                })
-                .collect(),
+            conditional_formatting: ws.conditional_formatting.clone(),
             index: (),
         }
     }
@@ -592,7 +464,7 @@ mod test {
     use super::*;
     use crate::cf_types::{CfRuleInput, ValueOperator};
     use crate::collab::log::{Commit, Consumer};
-    use crate::types::{Color, Comment as OrdinalComment, Dxf, Fill, Link, Style};
+    use crate::types::{Color, Comment as OrdinalComment, Dxf, Fill, Link, MergedCell, Style};
     use crate::Model;
 
     fn source() -> Model<'static> {
@@ -1010,6 +882,10 @@ mod test {
             })
         ));
         assert_eq!(a.get_formatted_cell_value(0, 3, 1).unwrap(), "30"); // A3=30
-        assert!(a.workbook.worksheets[0].stored_cell(3, 1).is_none());
+                                                                        // The covered cells are derived, as a dynamic spill's are: no authored value.
+        assert!(matches!(
+            a.workbook.worksheets[0].cell(3, 1).as_deref(),
+            Some(Cell::SpillCell { .. })
+        ));
     }
 }

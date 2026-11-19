@@ -44,13 +44,13 @@ use crate::cf_types::CfRule;
 use crate::collab::formula::StableFormula;
 use crate::collab::fractional_index::{virtual_ordinal, FractionalKey};
 use crate::collab::log::Timestamp;
-use crate::collab::model::{Stable, StableCellAddress, StableLink, StableRange};
+use crate::collab::model::{CommentBody, StableCellAddress, StableLink, StableRange};
 use crate::collab::DynError;
 use crate::constants::{DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT};
 use crate::expressions::token::Error;
 use crate::types::{
-    BorderItem, Color, Comment, Dxf, FontScheme, HorizontalAlignment, SheetState, Style,
-    StyleIncludes, Theme, VerticalAlignment,
+    BorderItem, Color, Dxf, FontScheme, HorizontalAlignment, SheetState, Style, StyleIncludes,
+    Theme, VerticalAlignment,
 };
 use crate::{COLUMN_WIDTH_FACTOR, ROW_HEIGHT_FACTOR};
 use bitcode::{Decode, Encode};
@@ -557,7 +557,7 @@ pub enum Patch {
         prev: Vec<FractionalKey>,
     },
     /// A property write over a column *span*, addressed by its corner keys — see
-    /// [`Col`](crate::types::Col) for what a span covers. A [`FractionalKey::NULL`] corner is an
+    /// [`ColSpan`](crate::collab::model::ColSpan) for what a span covers. A [`FractionalKey::NULL`] corner is an
     /// open end: `(NULL, k)` and `(k, NULL)` are half-open, and `(NULL, NULL)` is every column,
     /// including ones no replica has materialized yet — the register whole-sheet styling writes to,
     /// which ordinal code spells as a `(1, LAST_COLUMN)` record and stable-land cannot, having no
@@ -672,10 +672,10 @@ pub enum Patch {
     SetComment {
         sheet: SheetId,
         at: StableCellAddress,
-        comment: Option<Comment<Stable>>,
+        comment: Option<CommentBody>,
 
         #[bitcode(skip)]
-        prev: Option<Comment<Stable>>,
+        prev: Option<CommentBody>,
     },
     /// The link on a cell. Dynamic links (the ones `HYPERLINK` produces)
     /// are derived by evaluation and never written.
@@ -1299,7 +1299,7 @@ pub struct SheetContent {
     /// than inherits (its overrides), ordered by address.
     pub cell_parents: Vec<(StableCellAddress, NamedStyleId, StyleIncludes)>,
     pub merge_cells: Vec<StableRange>,
-    pub comments: Vec<Comment<Stable>>,
+    pub comments: Vec<(StableCellAddress, CommentBody)>,
     pub links: Vec<(StableCellAddress, StableLink)>,
     /// Ordered by the [`FractionalKey`] that is each rule's identity.
     pub conditional_formatting: Vec<(FractionalKey, ConditionalFormatState)>,
@@ -1402,12 +1402,35 @@ pub enum CellInput {
 mod test {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use crate::collab::formula::StableToken;
+    use crate::collab::formula::{StableAxisRef, StableRef, StableSheetRef};
     use crate::collab::hlc::Hlc;
 
-    /// A one-token stream: these tests are about the wire format, not about what a formula says.
+    /// A formula with one slot of each kind: these tests are about the wire format, not about what
+    /// a formula says.
     fn formula() -> StableFormula {
-        StableFormula::new(vec![StableToken::Number(3.5)]).expect("a literal is a formula")
+        let axis = |byte| StableAxisRef {
+            key: key(byte),
+            absolute: false,
+        };
+        StableFormula {
+            text: "R[0]C[0]+SUM(Data!R[1]C[0]:R[2]C[0])+tax+Nope!R1C1".to_string(),
+            refs: vec![
+                StableRef::Cell {
+                    sheet: StableSheetRef::Current,
+                    row: axis(1),
+                    col: axis(3),
+                },
+                StableRef::Range {
+                    sheet: StableSheetRef::Sheet(7),
+                    row1: axis(1),
+                    col1: axis(3),
+                    row2: axis(2),
+                    col2: axis(3),
+                },
+                StableRef::Name(3),
+                StableRef::Unresolved("Nope".to_string()),
+            ],
+        }
     }
 
     fn key(byte: u8) -> FractionalKey {
@@ -1421,12 +1444,11 @@ mod test {
         }
     }
 
-    fn comment() -> Comment<Stable> {
-        Comment {
+    fn comment() -> CommentBody {
+        CommentBody {
             text: "note".to_string(),
             author_name: "me".to_string(),
             author_id: None,
-            cell_ref: (key(1), key(3)),
         }
     }
 
@@ -1488,7 +1510,7 @@ mod test {
             cell_styles: vec![((key(1), key(3)), Style::default())],
             cell_parents: vec![((key(1), key(3)), 42, StyleIncludes::default())],
             merge_cells: vec![range()],
-            comments: vec![comment()],
+            comments: vec![((key(1), key(3)), comment())],
             links: vec![((key(1), key(3)), link())],
             conditional_formatting: vec![(
                 key(9),

@@ -504,10 +504,13 @@ impl<'a, A: Position> Model<'a, A> {
     /// `#CIRC!` and keeps no spill cells: its stale cells are dropped when it
     /// is marked, so there is nothing of it to read or to contradict.
     pub fn evaluate(&mut self) {
-        // Where spills are derived the order of the anchors is too: kept across evaluations
-        // it would depend on the history of the replica.
+        // since Stable spills cannot depend on history (it's relative to each replica)
+        // in that case we need to clear spills and rebuild them from scratch
         if A::CSE_SPILLS {
             self.evaluation.anchor_order.clear();
+            for worksheet in &mut self.workbook.worksheets {
+                A::drop_spills(worksheet);
+            }
         }
         self.sync_anchor_order();
         // Every pass starts from the same sheet: what an abandoned pass wrote
@@ -587,7 +590,7 @@ impl<'a, A: Position> Model<'a, A> {
     fn formula_positions(&self) -> Vec<CellReferenceIndex> {
         let mut found = Vec::new();
         for (sheet, worksheet) in self.sheets_with_formulas() {
-            for (row, column, cell) in worksheet.cells() {
+            for (row, column, cell) in worksheet.sheet_data.cells() {
                 if FormulaCell::of(&cell).is_some() {
                     found.push(CellReferenceIndex { sheet, row, column });
                 }
@@ -602,7 +605,7 @@ impl<'a, A: Position> Model<'a, A> {
     fn dynamic_spills(&self) -> Vec<(CellReferenceIndex, Cell)> {
         let mut found = Vec::new();
         for (sheet, worksheet) in self.sheets_with_formulas() {
-            for (row, column, cell) in worksheet.cells() {
+            for (row, column, cell) in worksheet.sheet_data.cells() {
                 if !matches!(*cell, Cell::ArrayFormula { .. } | Cell::SpillCell { .. }) {
                     continue;
                 }
@@ -626,7 +629,7 @@ impl<'a, A: Position> Model<'a, A> {
             .collect();
         for position in written_since {
             if let Ok(worksheet) = self.workbook.worksheet_mut(position.sheet) {
-                let _ = worksheet.cell_clear_contents(position.row, position.column);
+                let _ = A::clear_spill(worksheet, position.row, position.column);
             }
         }
         for (position, cell) in snapshot {
@@ -673,7 +676,7 @@ impl<'a, A: Position> Model<'a, A> {
     fn dynamic_anchors_in_natural_order(&self) -> Vec<CellReferenceIndex> {
         let mut found = Vec::new();
         for (sheet, worksheet) in self.sheets_with_formulas() {
-            for (row, column, cell) in worksheet.cells() {
+            for (row, column, cell) in worksheet.sheet_data.cells() {
                 // A CSE anchor goes with them where its covered cells are derived too.
                 let spills = match *cell {
                     Cell::ArrayFormula {
@@ -697,11 +700,6 @@ impl<'a, A: Position> Model<'a, A> {
     /// One pass over the workbook: anchors first, then every formula. Returns
     /// the reason the pass had to be abandoned, if any.
     fn run_pass(&mut self, circular_anchors: &[CellKey]) -> Option<Restart> {
-        // Spill cells are derived: every pass rebuilds them from nothing, so a representation
-        // keeping them out of `sheet_data` needs no per-anchor clearing of its own.
-        for worksheet in &mut self.workbook.worksheets {
-            A::drop_spills(worksheet);
-        }
         let state = &mut self.evaluation;
         state.cells.clear();
         state.stack.clear();

@@ -1,8 +1,8 @@
 use crate::collab::bind::Host;
-use crate::collab::model::{CollabModel, Stable};
+use crate::collab::model::CollabModel;
 use crate::expressions::parser::stringify::to_english_string;
 use crate::expressions::types::CellReferenceRC;
-use crate::types::{Position, RangeRef};
+use crate::types::RangeRef;
 
 /// The top-left of the bounding box of all its areas. An unbounded axis starts at 1.
 pub(crate) fn cf_anchor(ranges: &[RangeRef]) -> Option<(i32, i32)> {
@@ -30,17 +30,8 @@ impl CollabModel<'_> {
                 };
                 // A rule whose ranges all collapsed formats nothing, so there is no anchor to
                 // print against and nothing to show.
-                let ordinal: Vec<RangeRef> = sheet.conditional_formatting[at]
-                    .ranges
-                    .iter()
-                    .filter_map(|r| {
-                        Stable::resolve_range(r, &sheet.index).map(|(r1, c1, r2, c2)| RangeRef {
-                            rows: Some((r1, r2)),
-                            cols: Some((c1, c2)),
-                        })
-                    })
-                    .collect();
-                let Some((row, column)) = cf_anchor(&ordinal) else {
+                let Some((row, column)) = cf_anchor(&sheet.conditional_formatting[at].ranges)
+                else {
                     continue;
                 };
                 let context = CellReferenceRC {
@@ -51,15 +42,13 @@ impl CollabModel<'_> {
                 let host = Host::relative(i as u32, row, column);
                 let texts: Vec<String> = bodies
                     .iter()
-                    .map(|body| match self.lower(&body.formula, &host) {
-                        Ok(node) => {
-                            let text = to_english_string(&node, &context);
-                            match body.equals {
-                                true => format!("={text}"),
-                                false => text,
-                            }
+                    .map(|body| {
+                        let node = self.lower(&body.formula.text, &body.formula.refs, &host);
+                        let text = to_english_string(&node, &context);
+                        match body.equals {
+                            true => format!("={text}"),
+                            false => text,
                         }
-                        Err(_) => "#REF!".to_string(),
                     })
                     .collect();
                 let rule = &mut self.workbook.worksheets[i].conditional_formatting[at].cf_rule;
@@ -160,7 +149,7 @@ mod test {
         model.get_model().workbook.styles.dxfs.clone()
     }
 
-    fn assert_cf(a: &Peer, b: &Peer) {
+    fn assert_cf(a: &mut Peer, b: &mut Peer) {
         converged(a, b); // same cell contents
         assert_eq!(shown(a, 0), shown(b, 0), "conditional formatting list");
         for row in 1..=6 {
@@ -204,7 +193,7 @@ mod test {
                 Some(fill("#FF0000"))
             );
         }
-        assert_cf(&a, &b);
+        assert_cf(&mut a, &mut b);
 
         a.update_conditional_formatting(0, 0, "A1:A5", cell_is_gt("0", fill("#0000FF")))
             .unwrap();
@@ -212,7 +201,7 @@ mod test {
         for model in [&a, &b] {
             assert_eq!(color_at(model, 1, 1), Color::Rgb("#0000FF".to_string()));
         }
-        assert_cf(&a, &b);
+        assert_cf(&mut a, &mut b);
 
         let (before_a, before_b) = (dxfs(&a).len(), dxfs(&b).len());
         for _ in 0..3 {
@@ -223,7 +212,7 @@ mod test {
         assert_eq!(dxfs(&a).len(), before_a, "A's dxf table grew");
         assert_eq!(dxfs(&b).len(), before_b, "B's dxf table grew");
         assert_eq!(color_at(&a, 1, 1), Color::Rgb("#0000FF".to_string()));
-        assert_cf(&a, &b);
+        assert_cf(&mut a, &mut b);
     }
 
     #[test]
@@ -261,7 +250,7 @@ mod test {
         oracle.insert_rows(0, 1, 1).unwrap();
         oracle.insert_columns(0, 1, 1).unwrap();
 
-        assert_cf(&a, &b);
+        assert_cf(&mut a, &mut b);
         assert_eq!(list(&a), oracle.get_conditional_formatting_list(0).unwrap());
         for row in 1..=6 {
             for column in 1..=4 {
@@ -342,7 +331,7 @@ mod test {
             a.raise_conditional_formatting_priority(0, 0).unwrap();
             b.raise_conditional_formatting_priority(0, 0).unwrap();
             sync(&mut a, &mut b);
-            assert_cf(&a, &b);
+            assert_cf(&mut a, &mut b);
             assert_eq!(order(&a), order(&b));
         }
 
@@ -352,7 +341,7 @@ mod test {
             a.raise_conditional_formatting_priority(0, 0).unwrap(); // A over B
             b.lower_conditional_formatting_priority(0, 3).unwrap(); // D under C
             sync(&mut a, &mut b);
-            assert_cf(&a, &b);
+            assert_cf(&mut a, &mut b);
             // Both minted into the gap between B and C: same position, different session.
             let registers = &a.get_model().workbook.worksheets[0].index.registers;
             let moved = |at: usize| &registers.cf_positions[&registers.cf_order[at]].value;
@@ -362,7 +351,7 @@ mod test {
             assert_eq!(priority(&a), 2);
             a.raise_conditional_formatting_priority(0, 0).unwrap();
             deliver(&mut a, &mut b);
-            assert_cf(&a, &b);
+            assert_cf(&mut a, &mut b);
             assert_eq!(priority(&a), 3, "A stepped over the tie, below C");
             assert_eq!(order(&a), order(&b));
         }
@@ -374,7 +363,7 @@ mod test {
             a.raise_conditional_formatting_priority(0, 0).unwrap();
             b.lower_conditional_formatting_priority(0, 1).unwrap();
             sync(&mut a, &mut b);
-            assert_cf(&a, &b);
+            assert_cf(&mut a, &mut b);
             let after = order(&a);
             assert_ne!(after, before, "the rules did swap");
             assert_eq!(after, vec![before[1].clone(), before[0].clone()]);
@@ -387,11 +376,11 @@ mod test {
             a.raise_conditional_formatting_priority(0, 0).unwrap();
             b.delete_conditional_formatting(0, 0).unwrap();
             sync(&mut a, &mut b);
-            assert_cf(&a, &b);
+            assert_cf(&mut a, &mut b);
             assert_eq!(list(&a).len(), 2);
             b.undo().unwrap();
             deliver(&mut b, &mut a);
-            assert_cf(&a, &b);
+            assert_cf(&mut a, &mut b);
             assert_eq!(list(&a).len(), 3);
             // The raised rule is back above its old neighbour: it is the middle entry.
             assert_eq!(order(&a)[1], Some(fill("#000001")));
@@ -404,7 +393,7 @@ mod test {
             b.add_conditional_formatting(0, "A1:A5", cell_is_gt("0", fill("#00FF00")))
                 .unwrap();
             sync(&mut a, &mut b);
-            assert_cf(&a, &b);
+            assert_cf(&mut a, &mut b);
             assert_eq!(order(&a), order(&b));
         }
 
@@ -416,7 +405,7 @@ mod test {
             sync(&mut a, &mut b);
             a.undo().unwrap();
             deliver(&mut a, &mut b);
-            assert_cf(&a, &b);
+            assert_cf(&mut a, &mut b);
             assert_eq!(order(&a), order(&b));
         }
 
@@ -456,7 +445,7 @@ mod test {
         // The first rule now outranks the second, which is not the storage order.
         a.raise_conditional_formatting_priority(0, 0).unwrap();
         deliver(&mut a, &mut b);
-        assert_cf(&a, &b);
+        assert_cf(&mut a, &mut b);
 
         a.duplicate_sheet(0).unwrap();
         deliver(&mut a, &mut b);

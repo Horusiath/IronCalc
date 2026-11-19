@@ -174,7 +174,7 @@ pub(crate) fn violations(model: &mut TestModel) -> Vec<String> {
                     || (0..height).any(|i| {
                         (0..width).any(|j| {
                             (i, j) != (0, 0)
-                                && (ws.merged_range_containing(row + i, column + j).is_some()
+                                && (ws.merged_cell_containing(row + i, column + j).is_some()
                                     || match ws.cell(row + i, column + j).as_deref() {
                                         None | Some(Cell::EmptyCell { .. }) => false,
                                         Some(Cell::SpillCell { a, .. }) => *a != (row, column),

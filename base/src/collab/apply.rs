@@ -16,12 +16,15 @@ use std::hash::Hash;
 use crate::cf_types::{CfRule, ConditionalFormatting};
 use crate::collab::bind::Host;
 use crate::collab::codec::CodecError;
-use crate::collab::formula::StableFormula;
-use crate::collab::fractional_index::{virtual_key, Entry, FractionalIndex, FractionalKey};
+use crate::collab::formula::{unresolved_names, FormulaRefs, StableRef};
+use crate::collab::fractional_index::{
+    virtual_key, Entry, FractionalIndex, FractionalKey, Reorder,
+};
 use crate::collab::hlc::Hlc;
 use crate::collab::log::{Commit, Consumer, Lww, SessionId, Snapshot, Timestamp};
 use crate::collab::model::{
-    CollabModel, SheetIndexes, SheetRegisters, Stable, StableCellAddress, StableLink,
+    resolve_axis, ColSpan, CollabModel, Dirty, NameView, SheetRegisters, Stable, StableCellAddress,
+    StableIndexes, StableLink,
 };
 use crate::collab::naming::NameRepair;
 use crate::collab::patch::{
@@ -30,17 +33,13 @@ use crate::collab::patch::{
     SheetIndexSeed, SheetProperty, StableCfRule, StyleCategory, WorkbookProperty,
 };
 use crate::collab::DynError;
-use crate::constants::{
-    COLUMN_WIDTH_FACTOR, DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT, LAST_COLUMN, LAST_ROW,
-    ROW_HEIGHT_FACTOR,
-};
+use crate::constants::{DEFAULT_ROW_HEIGHT, LAST_COLUMN, LAST_ROW, ROW_HEIGHT_FACTOR};
 use crate::evaluation::KeyBuild;
-use crate::expressions::parser::stringify::to_english_string;
+use crate::expressions::parser::stringify::{to_english_string, to_rc_format};
 use crate::expressions::parser::{static_analysis::run_static_analysis_on_node, Node};
-use crate::expressions::token;
 use crate::types::{
-    Alignment, ArrayKind, Cell, CellStyles, Col, DefinedName, FormulaValue, Row, SheetState, Style,
-    StyleIncludes, Styles, Workbook, Worksheet,
+    Alignment, ArrayKind, Cell, CellStyles, Col, Comment, DefinedName, FormulaValue, MergedCell,
+    Position, Row, SheetState, Style, StyleIncludes, Styles, Workbook, Worksheet,
 };
 
 /// Version byte prefixing every [`Snapshot::encode`] payload.
@@ -102,10 +101,17 @@ impl Snapshot for CollabModel<'static> {
         }
         for sheet in &mut model.workbook.worksheets {
             rebuild_touched(&mut sheet.index);
-            sheet.sheet_data.rebuild_derived();
+            // A snapshot may hold spills.
+            sheet.index.spilled.0 = true;
         }
         model.index_unresolved();
-        model.resync_parsed();
+        // Re-derives what the payload already holds, as the baseline later commits compare with.
+        model.normalize_defined_names();
+        model.refresh_parse_tables();
+        model.lower_all();
+        for i in 0..model.workbook.worksheets.len() {
+            model.derive_sparse(i);
+        }
         Ok(model)
     }
 }
@@ -246,63 +252,163 @@ fn touches_sheet_names(patches: &[Patch]) -> bool {
     })
 }
 
-/// Whether `keys` sit in the last `keys.len()` positions of `index` — an append that displaced no
-/// existing element, so no ordinal moved. Read after the insert has been applied, when every key is
-/// still active.
-///
-/// `keys` should always be in ascending order.
-fn is_append_only(index: &FractionalIndex, keys: &[FractionalKey]) -> bool {
-    debug_assert!(keys.is_sorted());
-    let Some(first) = keys.first() else {
-        return true;
-    };
-    keys.len() <= index.len() && index.position_of(first) == Some(index.len() - keys.len())
+fn displaces(reorders: &[Reorder], len: usize) -> bool {
+    let inserted: usize = (reorders.iter())
+        .map(|r| match r {
+            Reorder::Inserted { count, .. } => *count,
+            _ => 0,
+        })
+        .sum();
+    let old = len.saturating_sub(inserted);
+    (reorders.iter()).any(|r| match r {
+        Reorder::Inserted { at, .. } => *at < old,
+        Reorder::Removed { .. } | Reorder::Moved { .. } => true,
+    })
 }
 
-/// Index of `formula` in a sheet's shared formula table, appending it if new. Indices are assigned
-/// per replica, which is why patches carry the stream itself.
-fn intern_formula(formulas: &mut Vec<StableFormula>, formula: &StableFormula) -> i32 {
-    match formulas.iter().position(|f| f == formula) {
-        Some(index) => index as i32,
-        None => {
-            formulas.push(formula.clone());
-            formulas.len() as i32 - 1
+fn store_style(sheet: &mut Worksheet<Stable>, (row, column): (i32, i32), s: i32) {
+    let cell = sheet.sheet_data.cell(row, column);
+    if matches!(cell.as_deref(), Some(Cell::SpillCell { .. })) {
+        // Kept for when the spill goes, and shown meanwhile as the ordinal model shows it.
+        match s {
+            0 => sheet.index.covered.remove(&(row, column)),
+            s => sheet.index.covered.insert((row, column), s),
+        };
+        if let Some(cell) = sheet.sheet_data.cell_mut(row, column) {
+            cell.set_style(s);
         }
-    }
-}
-
-fn cell_style(sheet: &Worksheet<Stable>, at: &StableCellAddress) -> i32 {
-    sheet
-        .sheet_data
-        .cell(&at.0, &at.1)
-        .map(|cell| cell.get_style())
-        .unwrap_or(0)
-}
-
-fn store_style(sheet: &mut Worksheet<Stable>, at: &StableCellAddress, s: i32) {
-    let cell = sheet.sheet_data.cell(&at.0, &at.1);
-    if s == 0 && matches!(cell, None | Some(Cell::EmptyCell { .. })) {
-        sheet.sheet_data.remove_cell(&at.0, &at.1);
         return;
     }
-    match sheet.sheet_data.cell_mut(&at.0, &at.1) {
+    if s == 0 && matches!(cell.as_deref(), None | Some(Cell::EmptyCell { .. })) {
+        sheet.sheet_data.remove_cell(row, column);
+        return;
+    }
+    match sheet.sheet_data.cell_mut(row, column) {
         Some(cell) => cell.set_style(s),
         None => {
             sheet
                 .sheet_data
-                .insert_cell(at.0.clone(), at.1.clone(), Cell::EmptyCell { s });
+                .set_cell(row, column, Cell::EmptyCell { s });
         }
     }
 }
 
-/// The cell a [`CellInput`] materializes into, keeping the style already on the cell. Formula text
-/// is interned into the sheet's table but never parsed — evaluation is derived state.
-fn build_cell(
+#[derive(Clone, Copy)]
+enum Axis {
+    Rows,
+    Columns,
+}
+
+impl Worksheet<Stable> {
+    /// Applies the reordering events from [FractionalIndex::reorders] for a given axis onto
+    /// sheet's rows/column, so that they keep the same order as the fractional index.
+    fn apply_reorder(&mut self, axis: Axis) {
+        let Worksheet {
+            index,
+            sheet_data,
+            rows,
+            ..
+        } = self;
+        let fi = match axis {
+            Axis::Rows => &mut index.rows,
+            Axis::Columns => &mut index.cols,
+        };
+        let reorders = fi.reorders();
+        if reorders.is_empty() {
+            return;
+        }
+        index.reordered.0 |= displaces(reorders, fi.len());
+        // On the rows axis the row records follow the same change as the cells: record `r` keeps
+        // naming `active[r - 1]`, and `rows` stays sorted by `r`. A removed row's record goes with
+        // it; the handler that hides a row takes out what it keeps first.
+        for &change in reorders {
+            match (axis, change) {
+                (Axis::Rows, Reorder::Inserted { at, count }) => {
+                    let (at, count) = (at as i32 + 1, count as i32);
+                    for row in rows.iter_mut().filter(|row| row.r >= at) {
+                        row.r += count;
+                    }
+                    sheet_data.insert_rows(at, count);
+                }
+                (Axis::Columns, Reorder::Inserted { at, count }) => {
+                    sheet_data.insert_columns(at as i32 + 1, count as i32)
+                }
+                (Axis::Rows, Reorder::Removed { at, count }) => {
+                    let (first, count) = (at as i32 + 1, count as i32);
+                    rows.retain_mut(|row| {
+                        if row.r >= first + count {
+                            row.r -= count;
+                            return true;
+                        }
+                        row.r < first
+                    });
+                    sheet_data.remove_rows(first, count);
+                }
+                (Axis::Columns, Reorder::Removed { at, count }) => {
+                    sheet_data.remove_columns(at as i32 + 1, count as i32)
+                }
+                (Axis::Rows, Reorder::Moved { from, to }) => {
+                    let (from, to) = (from as i32 + 1, to as i32 + 1);
+                    let (lo, hi) = (from.min(to), from.max(to));
+                    let start = rows.partition_point(|row| row.r < lo);
+                    let end = rows.partition_point(|row| row.r <= hi);
+                    let span = &mut rows[start..end];
+                    for row in span.iter_mut() {
+                        row.r = match row.r {
+                            r if r == from => to,
+                            r if from < to => r - 1,
+                            r => r + 1,
+                        };
+                    }
+                    // The moved record went from one end of the span to the other.
+                    if from < to && span.first().is_some_and(|row| row.r == to) {
+                        span.rotate_left(1);
+                    } else if from > to && span.last().is_some_and(|row| row.r == to) {
+                        span.rotate_right(1);
+                    }
+                    sheet_data.move_row(from, to);
+                }
+                (Axis::Columns, Reorder::Moved { from, to }) => {
+                    sheet_data.move_column(from as i32 + 1, to as i32 + 1)
+                }
+            }
+        }
+        fi.clear_reorders();
+    }
+}
+
+/// Applies a delete stamped `at` to the cell at `(row, column)`: what [`keep_cell`] keeps stays,
+/// the rest goes. A spill is no cell, and a position outside the index holds nothing but spills.
+fn retain_cell(
     sheet: &mut Worksheet<Stable>,
-    input: &CellInput,
-    style: i32,
-    shared_string: i32,
-) -> Cell {
+    styles: &mut Styles,
+    (row, column): (i32, i32),
+    at: Hlc,
+) {
+    let Worksheet {
+        sheet_data, index, ..
+    } = sheet;
+    let Some(cell) = sheet_data.cell_mut(row, column) else {
+        return;
+    };
+    let keys = (
+        index.rows.key(row as usize - 1),
+        index.cols.key(column as usize - 1),
+    );
+    let kept = match keys {
+        (Some(r), Some(c)) if !matches!(cell, Cell::SpillCell { .. }) => {
+            keep_cell(&index.registers, styles, &(r.clone(), c.clone()), at, cell)
+        }
+        _ => false,
+    };
+    if !kept {
+        sheet_data.remove_cell(row, column);
+    }
+}
+
+/// The cell a [`CellInput`] materializes into, keeping the style already on the cell. A formula
+/// cell points at entry `f` of the sheet's formulas.
+fn build_cell(input: &CellInput, style: i32, shared_string: i32, f: i32) -> Cell {
     match input {
         CellInput::Number(v) => Cell::NumberCell { v: *v, s: style },
         CellInput::Boolean(v) => Cell::BooleanCell { v: *v, s: style },
@@ -314,25 +420,21 @@ fn build_cell(
             ei: ei.clone(),
             s: style,
         },
-        CellInput::Formula(formula) => Cell::CellFormula {
-            f: intern_formula(&mut sheet.shared_formulas, formula),
+        CellInput::Formula(_) => Cell::CellFormula {
+            f,
             s: style,
             v: FormulaValue::Unevaluated,
         },
-        CellInput::Array(formula) => Cell::ArrayFormula {
-            f: intern_formula(&mut sheet.shared_formulas, formula),
+        CellInput::Array(_) => Cell::ArrayFormula {
+            f,
             s: style,
             r: (1, 1),
             kind: ArrayKind::Dynamic,
             v: FormulaValue::Unevaluated,
         },
         // A nonsensical extent from the wire is clamped to the grid rather than trusted.
-        CellInput::Cse {
-            formula,
-            width,
-            height,
-        } => Cell::ArrayFormula {
-            f: intern_formula(&mut sheet.shared_formulas, formula),
+        CellInput::Cse { width, height, .. } => Cell::ArrayFormula {
+            f,
             s: style,
             r: ((*width).clamp(1, LAST_COLUMN), (*height).clamp(1, LAST_ROW)),
             kind: ArrayKind::Cse,
@@ -379,7 +481,7 @@ fn keep_cell(
 
 /// Whether a write stamped `ts` to `at` is dead: its row or column was removed at or after it,
 /// revived since or not.
-pub(crate) fn cell_deleted(index: &SheetIndexes, at: &StableCellAddress, ts: Hlc) -> bool {
+pub(crate) fn cell_deleted(index: &StableIndexes, at: &StableCellAddress, ts: Hlc) -> bool {
     let removed = |e: Option<&Entry>| e.is_some_and(|e| ts <= e.removed_at);
     removed(index.rows.entry_by_id(&at.0)) || removed(index.cols.entry_by_id(&at.1))
 }
@@ -391,13 +493,26 @@ fn identities(index: &FractionalIndex, keys: &[FractionalKey]) -> Vec<Fractional
         .collect()
 }
 
-fn touch_cell(index: &mut SheetIndexes, at: &StableCellAddress, ts: Hlc) -> (bool, bool) {
-    let (row, row_removed) = index.rows.touch(&at.0, ts);
-    let (col, col_removed) = index.cols.touch(&at.1, ts);
-    (row || col, ts <= row_removed || ts <= col_removed)
+/// Touches the row and column of a write to `at` stamped `ts`, a revive putting its row or column
+/// back into the cells too and marking the sheet reordered: a revive at the tail moves nothing, but
+/// brings back references lowered dead. Returns whether the write is dead.
+fn touch_cell(sheet: &mut Worksheet<Stable>, at: &StableCellAddress, ts: Hlc) -> bool {
+    let (row, row_removed) = sheet.index.rows.touch(&at.0, ts);
+    if row {
+        Stable::drop_spills(sheet);
+        sheet.apply_reorder(Axis::Rows);
+        unhide_row(sheet, &at.0);
+    }
+    let (col, col_removed) = sheet.index.cols.touch(&at.1, ts);
+    if col {
+        Stable::drop_spills(sheet);
+        sheet.apply_reorder(Axis::Columns);
+    }
+    sheet.index.reordered.0 |= row || col;
+    ts <= row_removed || ts <= col_removed
 }
 
-fn rebuild_touched(index: &mut SheetIndexes) {
+fn rebuild_touched(index: &mut StableIndexes) {
     let registers = &index.registers;
     let (row_floor, col_floor) = (index.rows.moved_floor(), index.cols.moved_floor());
     let mut rows: HashMap<_, _, KeyBuild> = HashMap::default();
@@ -420,53 +535,140 @@ fn rebuild_touched(index: &mut SheetIndexes) {
     for (col, ts) in cols {
         index.cols.touch(col, ts);
     }
+    // The active order already reflects every touch: it was encoded, or seeded, after them.
+    debug_assert!(
+        index.rows.reorders().is_empty() && index.cols.reorders().is_empty(),
+        "a rebuilt touch changed visibility"
+    );
+    index.rows.clear_reorders();
+    index.cols.clear_reorders();
 }
 
-/// The row and column record lists are kept sorted by the key they are filed under, so that two
-/// replicas that saw the same writes in different orders still hold byte-identical worksheets.
-fn row_record<'r>(sheet: &'r mut Worksheet<Stable>, key: &FractionalKey) -> &'r mut Row<Stable> {
-    let at = match sheet.rows.binary_search_by(|r| r.r.cmp(key)) {
-        Ok(at) => return &mut sheet.rows[at],
-        Err(at) => at,
+/// Puts a row's record back among the visible ones if the row is visible again: called for every
+/// row an index operation may have revived, after its reorders were followed.
+fn unhide_row(sheet: &mut Worksheet<Stable>, identity: &FractionalKey) {
+    if !sheet.index.hidden_rows.contains_key(identity) {
+        return;
+    }
+    let Some(p) = sheet.index.rows.position_of(identity) else {
+        return;
     };
-    sheet.rows.insert(
-        at,
-        Row {
-            r: key.clone(),
-            height: DEFAULT_ROW_HEIGHT / ROW_HEIGHT_FACTOR,
-            custom_format: false,
-            custom_height: false,
-            s: 0,
-            hidden: false,
-        },
-    );
-    &mut sheet.rows[at]
+    let Some(mut row) = sheet.index.hidden_rows.remove(identity) else {
+        return;
+    };
+    row.r = p as i32 + 1;
+    let at = sheet.rows.partition_point(|other| other.r < row.r);
+    sheet.rows.insert(at, row);
 }
 
-/// See [`row_record`]; a column record is filed under its span's two corners.
-fn col_record<'r>(
-    sheet: &'r mut Worksheet<Stable>,
-    span: &(FractionalKey, FractionalKey),
-) -> &'r mut Col<Stable> {
-    let at = match sheet
-        .cols
-        .binary_search_by(|c| (&c.min, &c.max).cmp(&(&span.0, &span.1)))
-    {
-        Ok(at) => return &mut sheet.cols[at],
-        Err(at) => at,
+/// Applies a delete to a row record: only the properties `kept` (written after the delete)
+/// survive it.
+fn filter_row(styles: &mut Styles, row: &mut Row, kept: impl Fn(PropKind) -> bool) {
+    row.s = filter_styles(styles, row.s, &kept);
+    row.custom_format = row.s != 0;
+    if !kept(PropKind::Height) {
+        row.height = DEFAULT_ROW_HEIGHT / ROW_HEIGHT_FACTOR;
+        row.custom_height = false;
+    }
+    if !kept(PropKind::Hidden) {
+        row.hidden = false;
+    }
+}
+
+/// The ordinal `cols` records `index.col_spans` resolves to: per column and per property, the
+/// covering span whose register for it is newest, coalesced into runs of equal records. A span
+/// open at its upper end also covers the columns past the index's tail.
+fn derive_cols(index: &StableIndexes) -> Vec<Col> {
+    if index.col_spans.is_empty() {
+        return Vec::new();
+    }
+    let registers = &index.registers.col_spans;
+    let len = index.cols.len() as i32;
+    // Sorted by span, so that on a tie of stamps the first span wins, whatever the map's order.
+    let mut spans: Vec<_> = index.col_spans.iter().collect();
+    spans.sort_by_key(|&(span, _)| span);
+    struct Covering<'a> {
+        interval: Option<(i32, i32)>,
+        open: bool,
+        state: &'a ColSpan,
+        width: Option<Timestamp>,
+        hidden: Option<Timestamp>,
+        style: Option<Timestamp>,
+    }
+    let spans: Vec<Covering> = spans
+        .into_iter()
+        .map(|(span, state)| {
+            let stamp = |kind| registers.get(&(span.clone(), kind)).copied();
+            Covering {
+                interval: resolve_axis(&index.cols, &Some(span.clone())),
+                open: span.1.is_empty(),
+                state,
+                width: stamp(PropKind::Width),
+                hidden: stamp(PropKind::Hidden),
+                style: PropKind::STYLE.into_iter().filter_map(stamp).max(),
+            }
+        })
+        .collect();
+    // The record of one column, or of the tail: the newest covering write of each property.
+    let record = |covers: &dyn Fn(&Covering) -> bool| -> ColSpan {
+        let newest = |stamp: fn(&Covering) -> Option<Timestamp>| {
+            let mut best: Option<(Timestamp, &ColSpan)> = None;
+            for span in spans.iter().filter(|span| covers(span)) {
+                let Some(ts) = stamp(span) else {
+                    continue;
+                };
+                if best.is_none_or(|(stored, _)| stored < ts) {
+                    best = Some((ts, span.state));
+                }
+            }
+            best.map(|(_, state)| state)
+        };
+        let mut out = ColSpan::default();
+        if let Some(state) = newest(|span| span.width) {
+            out.width = state.width;
+            out.custom_width = state.custom_width;
+        }
+        if let Some(state) = newest(|span| span.hidden) {
+            out.hidden = state.hidden;
+        }
+        if let Some(state) = newest(|span| span.style) {
+            out.style = state.style;
+        }
+        out
     };
-    sheet.cols.insert(
-        at,
-        Col {
-            min: span.0.clone(),
-            max: span.1.clone(),
-            width: DEFAULT_COLUMN_WIDTH / COLUMN_WIDTH_FACTOR,
-            custom_width: false,
-            hidden: false,
-            style: None,
-        },
-    );
-    &mut sheet.cols[at]
+    let mut cols: Vec<Col> = Vec::new();
+    let mut push = |min: i32, max: i32, state: ColSpan| {
+        if state == ColSpan::default() {
+            return;
+        }
+        if let Some(last) = cols.last_mut() {
+            let same = (last.width, last.custom_width, last.hidden, last.style)
+                == (state.width, state.custom_width, state.hidden, state.style);
+            if same && last.max + 1 == min {
+                last.max = max;
+                return;
+            }
+        }
+        cols.push(Col {
+            min,
+            max,
+            width: state.width,
+            custom_width: state.custom_width,
+            hidden: state.hidden,
+            style: state.style,
+        });
+    };
+    for column in 1..=len {
+        let state = record(&|span: &Covering| {
+            span.interval
+                .is_some_and(|(lo, hi)| (lo..=hi).contains(&column))
+        });
+        push(column, column, state);
+    }
+    if len < LAST_COLUMN {
+        push(len + 1, LAST_COLUMN, record(&|span: &Covering| span.open));
+    }
+    cols
 }
 
 /// Renumbers the priorities, which is what a rule's position key *means*: rank by the position
@@ -490,7 +692,7 @@ fn rank_cf(sheet: &mut Worksheet<Stable>) {
 }
 
 /// Files a rule at the slot its identity key sorts to, which keeps storage in creation order.
-fn insert_cf(sheet: &mut Worksheet<Stable>, key: FractionalKey, cf: ConditionalFormatting<Stable>) {
+fn insert_cf(sheet: &mut Worksheet<Stable>, key: FractionalKey, cf: ConditionalFormatting) {
     let order = &mut sheet.index.registers.cf_order;
     let at = order.binary_search(&key).unwrap_or_else(|at| at);
     order.insert(at, key);
@@ -529,6 +731,7 @@ impl CollabModel<'_> {
     /// Puts the worksheets back in tab order. A sheet with no position sorts last by id, which
     /// keeps the ordering total.
     fn sort_sheets(&mut self) {
+        let before = self.sheet_ids();
         let positions = std::mem::take(&mut self.workbook.meta.sheet_positions);
         self.workbook.worksheets.sort_by(|a, b| {
             match (
@@ -543,6 +746,46 @@ impl CollabModel<'_> {
             }
         });
         self.workbook.meta.sheet_positions = positions;
+        self.realign_parsed(before);
+    }
+
+    fn sheet_ids(&self) -> Vec<SheetId> {
+        (self.workbook.worksheets.iter())
+            .map(|ws| ws.sheet_id)
+            .collect()
+    }
+
+    /// Follows a change to the order of the worksheets, which were in `before` order, with their
+    /// parse tables. A sheet that changed position changes the sheet index every reference to it
+    /// lowered with, so its users re-lower.
+    fn realign_parsed(&mut self, before: Vec<SheetId>) {
+        let mut parsed: HashMap<SheetId, (usize, Vec<_>)> = (before.into_iter())
+            .zip(std::mem::take(&mut self.parsed_formulas))
+            .enumerate()
+            .map(|(at, (id, parsed))| (id, (at, parsed)))
+            .collect();
+        for (at, sheet) in self.workbook.worksheets.iter().enumerate() {
+            let entries = match parsed.remove(&sheet.sheet_id) {
+                Some((was, entries)) => {
+                    if was != at {
+                        self.local.dirty.sheets.insert(sheet.sheet_id);
+                        self.local.dirty.structural = true;
+                    }
+                    entries
+                }
+                None => Vec::new(),
+            };
+            self.parsed_formulas.push(entries);
+        }
+    }
+
+    /// Notes that a sheet changed in a way every formula naming it, and every unbound name, may
+    /// lower differently after.
+    fn sheet_changed(&mut self, sheet: SheetId) {
+        let dirty = &mut self.local.dirty;
+        dirty.sheets.insert(sheet);
+        dirty.unbound = true;
+        dirty.structural = true;
     }
 
     /// Files a sheet's authored name, under the same last-write-wins arbitration as every other
@@ -576,8 +819,11 @@ impl CollabModel<'_> {
                 None => debug_assert!(false, "sheet {} has no authored name", sheet.sheet_id),
             }
         }
-        for ((_, i), name) in SHEET_NAMES.assign(authored) {
-            self.workbook.worksheets[i].name = name;
+        for ((id, i), name) in SHEET_NAMES.assign(authored) {
+            if self.workbook.worksheets[i].name != name {
+                self.workbook.worksheets[i].name = name;
+                self.sheet_changed(id);
+            }
         }
     }
 
@@ -676,8 +922,14 @@ impl CollabModel<'_> {
             .inheritance(sheet_idx, at, reference)
             .map(|(xf_id, definition, inherited)| (xf_id, definition.style.clone(), inherited));
         let sheet = &mut self.workbook.worksheets[sheet_idx];
+        // Hidden: nothing to show, and a revive re-derives it.
+        let Some(position) = sheet.ordinal(at) else {
+            return;
+        };
         let styles = &mut self.workbook.styles;
-        let mut own = styles.get_style(cell_style(sheet, at)).unwrap_or_default();
+        let mut own = styles
+            .get_style(sheet.authored_style(position).unwrap_or(0))
+            .unwrap_or_default();
         let s = match parent {
             None => styles.get_style_index_or_create(&canonical(own)),
             Some((xf_id, style, inherited)) => {
@@ -697,7 +949,7 @@ impl CollabModel<'_> {
                 styles.get_parented_style_index_or_create(&canonical(own), xf_id, apply)
             }
         };
-        store_style(sheet, at, s);
+        store_style(sheet, position, s);
     }
 
     fn derive_parented(&mut self) {
@@ -746,33 +998,56 @@ impl CollabModel<'_> {
     }
 
     /// Derives `Workbook::defined_names` from the registers, the way the style table is derived:
-    /// the live names, repaired first-write-wins within each scope.
-    fn normalize_defined_names(&mut self) {
+    /// the live names, repaired first-write-wins within each scope. Returns the names whose
+    /// lowered form changed since the last call.
+    fn normalize_defined_names(&mut self) -> Vec<DefinedNameId> {
         let context = self.defined_name_context();
         let display = self.defined_name_display();
         let mut derived = Vec::with_capacity(display.len());
+        let mut views: Vec<(DefinedNameId, NameView)> = Vec::with_capacity(display.len());
         for (id, sheet_id, name) in display {
             let Some(body) = self.formula_of(id) else {
                 continue;
             };
-            let Ok(node) = self.lower(&body.formula, &Host::relative(0, 1, 1)) else {
-                continue;
-            };
+            let node = self.lower(
+                &body.formula.text,
+                &body.formula.refs,
+                &Host::relative(0, 1, 1),
+            );
             let text = to_english_string(&node, &context);
+            let formula = match body.equals {
+                true => format!("={text}"),
+                false => text,
+            };
+            let scope = sheet_id.map(|sheet| self.sheet_index(sheet).map(|at| at as u32));
+            views.push((id, (name.clone(), scope, formula.clone())));
             derived.push(DefinedName {
                 name,
-                formula: match body.equals {
-                    true => format!("={text}"),
-                    false => text,
-                },
+                formula,
                 sheet_id,
             });
         }
         self.workbook.defined_names = derived;
+        // Both are sorted by id: what is in one and not equal in the other changed.
+        let old = std::mem::replace(&mut self.local.name_views, views);
+        let new = &self.local.name_views;
+        let changed = |from: &[(DefinedNameId, NameView)], to: &[(DefinedNameId, NameView)]| {
+            (from.iter())
+                .filter(|entry| {
+                    to.binary_search_by_key(&entry.0, |(id, _)| *id)
+                        .map(|at| &to[at])
+                        != Ok(entry)
+                })
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>()
+        };
+        let mut ids = changed(&old, new);
+        ids.extend(changed(new, &old));
+        ids
     }
 
     /// Re-derives what a commit invalidated. Display names come first: the parse tables resolve
-    /// sheets and defined names by them.
+    /// sheets and defined names by them, and formulas show them.
     pub(crate) fn resync_derived(&mut self, patches: &[Patch]) {
         if touches_sheet_names(patches) {
             self.normalize_sheet_names();
@@ -784,109 +1059,210 @@ impl CollabModel<'_> {
             self.normalize_named_styles();
             self.derive_parented();
         }
-
-        // A revival (an insert re-applied over its own delete, e.g. redo) looks like a tail append,
-        // but formulas lowered while the key was dead hold stale `#REF!` nodes.
-        let revived = std::mem::take(&mut self.local.revived);
-        if !revived
-            && self.is_content_only(patches)
-            && self.parsed_formulas.len() == self.workbook.worksheets.len()
-        {
-            self.lower_formulas_tail();
-        } else {
+        // A sheet whose rows or columns moved under the formulas that reference it.
+        for sheet in &mut self.workbook.worksheets {
+            if std::mem::take(&mut sheet.index.reordered.0) {
+                self.local.dirty.sheets.insert(sheet.sheet_id);
+                self.local.dirty.structural = true;
+            }
+        }
+        let mut dirty = std::mem::take(&mut self.local.dirty);
+        if dirty.structural {
             #[cfg(test)]
             {
                 self.local.full_resyncs += 1;
             }
-            self.normalize_defined_names();
-            self.resync_parsed();
+            let renamed = self.normalize_defined_names();
+            if !renamed.is_empty() {
+                dirty.names.extend(renamed);
+                dirty.unbound = true;
+            }
+            self.refresh_parse_tables();
+        }
+        self.relower_dirty(&dirty);
+        // Sparse items are few: every sheet is re-derived, with no tracking of what moved.
+        for i in 0..self.workbook.worksheets.len() {
+            self.derive_sparse(i);
         }
         self.normalize_cf();
     }
 
-    /// Return `true` if none of the `patches` introduce changes that may trigger shift
-    /// in referenced cell positions.
-    pub(crate) fn is_content_only(&self, patches: &[Patch]) -> bool {
-        patches.iter().all(|patch| match patch {
-            Patch::SetCellValue { .. }
-            | Patch::SetCellStyle { .. }
-            | Patch::SetRowProperty { .. }
-            | Patch::SetColumnSpan { .. }
-            | Patch::SetNamedStyle { .. }
-            | Patch::AddConditionalFormat { .. }
-            | Patch::DeleteConditionalFormat { .. }
-            | Patch::SetConditionalFormat { .. }
-            | Patch::SetMergedRange { .. }
-            | Patch::SetComment { .. }
-            | Patch::SetCellLink { .. } => true,
-            Patch::SetSheetProperty { property, .. } => matches!(
-                property,
-                SheetProperty::Color(_)
-                    | SheetProperty::State(_)
-                    | SheetProperty::ShowGridLines(_)
-                    | SheetProperty::FrozenRows(_)
-                    | SheetProperty::FrozenColumns(_)
-            ),
-            // The locale drives defined-name parsing; the theme and the name drive nothing lowered.
-            Patch::SetWorkbookProperty { property, .. } => {
-                matches!(
-                    property,
-                    WorkbookProperty::Theme(_) | WorkbookProperty::Name(_)
-                )
-            }
-            // A tail append displaces no ordinal — which is what materialize-on-bind mints.
-            Patch::InsertRows { sheet, keys } => self
-                .sheet_index(*sheet)
-                .is_some_and(|i| is_append_only(&self.workbook.worksheets[i].index.rows, keys)),
-            Patch::InsertColumns { sheet, keys } => self
-                .sheet_index(*sheet)
-                .is_some_and(|i| is_append_only(&self.workbook.worksheets[i].index.cols, keys)),
-            _ => false,
-        })
-    }
-
-    /// Rebuilds the parse tables a commit invalidated. They are derived from `shared_formulas` and
-    /// the defined names, both of which patches append to, and re-deriving is cheaper than tracking
-    /// which sheet index moved where. Evaluation stays the caller's business.
-    pub(crate) fn resync_parsed(&mut self) {
+    /// The parser reads sheets and defined names by their display names, and the evaluator reads
+    /// defined names parsed.
+    fn refresh_parse_tables(&mut self) {
         let defined_names = self.workbook.get_defined_names_with_scope();
         self.parser
             .set_worksheets_and_names(self.workbook.get_worksheet_names(), defined_names);
-        self.lower_formulas();
         self.parse_defined_names();
     }
 
-    /// The stable twin of [`Model::parse_formulas`]: every shared entry lowered once per sheet.
-    ///
-    /// The lowering is all-absolute, because one entry serves every cell that interned it — `D1`
-    /// and `E1` both holding `=A1` share a binding — so the cached node cannot depend on a host.
-    /// An entry whose sheet is gone has no node at all and lowers to `#REF!`.
-    fn lower_formulas(&mut self) {
-        self.parsed_formulas = self
-            .workbook
-            .worksheets
-            .iter()
-            .map(|_| Vec::new())
-            .collect();
-        self.lower_formulas_tail();
+    /// Re-lowers, once each, the entries holding a slot on something `dirty` names.
+    fn relower_dirty(&mut self, dirty: &Dirty) {
+        for i in 0..self.workbook.worksheets.len() {
+            let index = &self.workbook.worksheets[i].index;
+            let mut entries: Vec<u32> = Vec::new();
+            for sheet in &dirty.sheets {
+                entries.extend(index.referenced_by.get(sheet).into_iter().flatten());
+            }
+            for name in &dirty.names {
+                entries.extend(index.names_referenced_by.get(name).into_iter().flatten());
+            }
+            if dirty.unbound {
+                entries.extend(&index.unbound);
+            }
+            entries.sort_unstable();
+            entries.dedup();
+            for f in entries {
+                self.relower(i, f as usize);
+            }
+        }
     }
 
-    fn lower_formulas_tail(&mut self) {
+    /// Lowers entry `f` of worksheet `i` again from its stored node and slots: no parse, and the
+    /// text and the static result are regenerated only if a leaf changed.
+    pub(crate) fn relower(&mut self, i: usize, f: usize) {
+        let sheet = &self.workbook.worksheets[i];
+        let (Some(entry), Some((node, _))) = (
+            sheet.index.formulas.get(f),
+            self.parsed_formulas.get(i).and_then(|parsed| parsed.get(f)),
+        ) else {
+            return;
+        };
+        let mut node = Node::clone(node);
+        if !self.overwrite_leaves(&mut node, &entry.refs, &sheet.host_of(i, &entry.host)) {
+            return;
+        }
+        self.store_lowered(i, f, node);
+    }
+
+    /// Stores `node` as entry `f` of worksheet `i`, appending when `f` is one past the end.
+    fn store_lowered(&mut self, i: usize, f: usize, node: Node) {
+        let text = to_rc_format(&node);
+        let static_result = run_static_analysis_on_node(&node);
+        let parsed = (std::sync::Arc::new(node), static_result);
+        let sheet = &mut self.workbook.worksheets[i];
+        if f == sheet.shared_formulas.len() {
+            sheet.shared_formulas.push(text);
+            self.parsed_formulas[i].push(parsed);
+        } else {
+            sheet.shared_formulas[f] = text;
+            self.parsed_formulas[i][f] = parsed;
+        }
+    }
+
+    /// Lowers `formula` into the entry of the cell `at`, at `(row, column)` of worksheet `i`: the
+    /// one it holds, `held`, if it already holds a formula, else a new one. Returns the entry.
+    fn lower_entry(
+        &mut self,
+        i: usize,
+        held: Option<i32>,
+        at: &StableCellAddress,
+        (row, column): (i32, i32),
+        refs: &[StableRef],
+        text: &str,
+    ) -> i32 {
+        let node = self.lower(text, refs, &Host::relative(i as u32, row, column));
+        let entry = FormulaRefs {
+            host: at.clone(),
+            refs: refs.to_vec(),
+        };
+        let sheet = &mut self.workbook.worksheets[i];
+        let (id, index) = (sheet.sheet_id, &mut sheet.index);
+        let f = match held.filter(|f| (*f as usize) < index.formulas.len()) {
+            Some(f) => {
+                index.unregister_formula(f as u32, id);
+                index.formulas[f as usize] = entry;
+                f as usize
+            }
+            None => {
+                index.formulas.push(entry);
+                index.formulas.len() - 1
+            }
+        };
+        index.register_formula(f as u32, id);
+        self.store_lowered(i, f, node);
+        f as i32
+    }
+
+    /// Lowers every entry from its stored text and slots, and files them: what a decoded workbook
+    /// holds, exactly as the commits that wrote it left it.
+    fn lower_all(&mut self) {
+        self.parsed_formulas = (self.workbook.worksheets.iter())
+            .map(|_| Vec::new())
+            .collect();
         for i in 0..self.workbook.worksheets.len() {
-            let done = self.parsed_formulas[i].len();
-            if self.workbook.worksheets[i].shared_formulas.len() <= done {
-                continue;
+            let sheet = &mut self.workbook.worksheets[i];
+            let (id, count) = (sheet.sheet_id, sheet.shared_formulas.len());
+            // Defensive: the two lists are kept aligned, entry for entry.
+            sheet.index.formulas.resize_with(count, || FormulaRefs {
+                host: (FractionalKey::NULL, FractionalKey::NULL),
+                refs: Vec::new(),
+            });
+            for f in 0..count {
+                sheet.index.register_formula(f as u32, id);
             }
-            // Taken out and put back so the lowering, which reads the whole workbook, can borrow.
-            let formulas = std::mem::take(&mut self.workbook.worksheets[i].shared_formulas);
-            for formula in &formulas[done..] {
-                let node = self
-                    .lower(formula, &Host::absolute(i as u32))
-                    .unwrap_or(Node::ErrorKind(token::Error::REF));
-                let static_result = run_static_analysis_on_node(&node);
-                self.parsed_formulas[i].push((std::sync::Arc::new(node), static_result));
+            let texts = std::mem::take(&mut sheet.shared_formulas);
+            for (f, text) in texts.iter().enumerate() {
+                let sheet = &self.workbook.worksheets[i];
+                let entry = &sheet.index.formulas[f];
+                let node = self.lower(text, &entry.refs, &sheet.host_of(i, &entry.host));
+                self.store_lowered(i, f, node);
             }
-            self.workbook.worksheets[i].shared_formulas = formulas;
+        }
+    }
+
+    /// Rewrites the ordinal `cols`, `merged_cells`, `comments`, `links` and conditional formatting
+    /// ranges of worksheet `i` from their keyed sources in its index. A pure function of the
+    /// sources and the index, in a fixed order, so replicas holding equal sources hold equal
+    /// worksheets.
+    pub(crate) fn derive_sparse(&mut self, i: usize) {
+        let sheet = &self.workbook.worksheets[i];
+        let index = &sheet.index;
+        let at = |(row, col): &StableCellAddress| {
+            let row = index.rows.position_of(row)? as i32 + 1;
+            let column = index.cols.position_of(col)? as i32 + 1;
+            Some((row, column))
+        };
+        let cols = derive_cols(index);
+        let merged_cells = (index.merges.iter())
+            .filter_map(|range| {
+                let (row, column, last_row, last_column) = range.merged_rect(index)?;
+                Some(MergedCell {
+                    row,
+                    column,
+                    width: last_column - column + 1,
+                    height: last_row - row + 1,
+                })
+            })
+            .collect();
+        let mut comments: Vec<Comment> = (index.comments.iter())
+            .filter_map(|(key, body)| {
+                Some(Comment {
+                    text: body.text.clone(),
+                    author_name: body.author_name.clone(),
+                    author_id: body.author_id.clone(),
+                    cell_ref: at(key)?,
+                })
+            })
+            .collect();
+        comments.sort_by_key(|c| c.cell_ref);
+        let links = (index.links.iter())
+            .filter_map(|(key, link)| Some((at(key)?, self.link_view(link))))
+            .collect();
+        // `cf_order` is aligned with the rules, entry by entry.
+        let cf_ranges: Vec<Vec<_>> = (index.registers.cf_order.iter())
+            .map(|key| {
+                let ranges = index.cf_ranges.get(key).map(Vec::as_slice).unwrap_or(&[]);
+                ranges.iter().filter_map(|r| r.to_ordinal(index)).collect()
+            })
+            .collect();
+        let sheet = &mut self.workbook.worksheets[i];
+        sheet.cols = cols;
+        sheet.merged_cells = merged_cells;
+        sheet.comments = comments;
+        sheet.links = links;
+        for (cf, ranges) in sheet.conditional_formatting.iter_mut().zip(cf_ranges) {
+            cf.ranges = ranges;
         }
     }
 
@@ -910,11 +1286,11 @@ impl CollabModel<'_> {
                     return Ok(());
                 };
                 let ts = at_ts.as_ref().unwrap_or(ts);
-                let index = &mut self.workbook.worksheets[i].index;
-                let (revived, dead) = touch_cell(index, at, ts.hlc);
-                self.local.revived |= revived;
+                let sheet = &mut self.workbook.worksheets[i];
+                let dead = touch_cell(sheet, at, ts.hlc);
                 // The guard is written either way; only the content is dead under a removal.
-                if !wins(&mut index.registers.cell_values, at, ts) || dead {
+                let won = wins(&mut sheet.index.registers.cell_values, at, ts);
+                if !won || dead {
                     return Ok(());
                 }
                 self.write_cell(i, at, value.as_ref());
@@ -930,9 +1306,9 @@ impl CollabModel<'_> {
                     return Ok(());
                 };
                 let ts = at_ts.as_ref().unwrap_or(ts);
+                let sheet = &mut self.workbook.worksheets[i];
+                let dead = touch_cell(sheet, at, ts.hlc);
                 let index = &mut self.workbook.worksheets[i].index;
-                let (revived, dead) = touch_cell(index, at, ts.hlc);
-                self.local.revived |= revived;
                 let won = winning(
                     &mut index.registers.cell_styles,
                     |k| (at.clone(), k),
@@ -957,9 +1333,17 @@ impl CollabModel<'_> {
                 }
                 let parented = reference.is_some() || index.parents.contains_key(at);
                 let sheet = &mut self.workbook.worksheets[i];
-                let s = overlay(&mut self.workbook.styles, cell_style(sheet, at), &won);
+                // A key with no position names nothing visible: registers only.
+                let Some(position) = sheet.ordinal(at) else {
+                    return Ok(());
+                };
+                let s = overlay(
+                    &mut self.workbook.styles,
+                    sheet.authored_style(position).unwrap_or(0),
+                    &won,
+                );
                 // Nothing left for the cell to hold, so it goes too.
-                store_style(sheet, at, s);
+                store_style(sheet, position, s);
                 // Whatever just won may have changed what the cell inherits and what it owns.
                 if parented {
                     self.derive_cell(i, at);
@@ -969,19 +1353,30 @@ impl CollabModel<'_> {
                 let Some(i) = self.sheet_index(*sheet) else {
                     return Ok(());
                 };
-                let index = &mut self.workbook.worksheets[i].index;
-                if index.rows.insert_keys_at(keys, ts.hlc) {
-                    self.local.revived = true;
+                let sheet = &mut self.workbook.worksheets[i];
+                // As the ordinal model resets its spills: what they covered never has to shift.
+                Stable::drop_spills(sheet);
+                // A revive at the tail moves nothing, but brings back keys references lowered dead.
+                let revived = sheet.index.rows.insert_keys_at(keys, ts.hlc);
+                sheet.index.reordered.0 |= revived;
+                sheet.apply_reorder(Axis::Rows);
+                // A fresh key has no record waiting; most sheets have none at all.
+                if !sheet.index.hidden_rows.is_empty() {
+                    for key in identities(&sheet.index.rows, keys) {
+                        unhide_row(sheet, &key);
+                    }
                 }
             }
             Patch::InsertColumns { sheet, keys } => {
                 let Some(i) = self.sheet_index(*sheet) else {
                     return Ok(());
                 };
-                let index = &mut self.workbook.worksheets[i].index;
-                if index.cols.insert_keys_at(keys, ts.hlc) {
-                    self.local.revived = true;
-                }
+                let sheet = &mut self.workbook.worksheets[i];
+                // As the ordinal model resets its spills: what they covered never has to shift.
+                Stable::drop_spills(sheet);
+                let revived = sheet.index.cols.insert_keys_at(keys, ts.hlc);
+                sheet.index.reordered.0 |= revived;
+                sheet.apply_reorder(Axis::Columns);
             }
             Patch::DeleteRows { sheet, keys, .. } => {
                 let Some(i) = self.sheet_index(*sheet) else {
@@ -991,39 +1386,73 @@ impl CollabModel<'_> {
                     worksheets, styles, ..
                 } = &mut self.workbook;
                 let sheet = &mut worksheets[i];
-                sheet.index.rows.remove_keys_at(keys, ts.hlc);
-                // Keys name positions; content is filed by identity.
+                Stable::drop_spills(sheet);
+                // Keys name positions; records are filed by identity.
                 let ids = identities(&sheet.index.rows, keys);
-                self.local.revived |= ids
+                let before: Vec<_> = ids
                     .iter()
-                    .any(|k| sheet.index.rows.position_of(k).is_some());
-                for key in &ids {
-                    // The delete is one more write per register: it takes what it outranks and
-                    // leaves what a newer write already claimed.
-                    let registers = &sheet.index.registers;
-                    sheet.sheet_data.retain_row(key, |col, cell| {
-                        keep_cell(registers, styles, &(key.clone(), col.clone()), ts.hlc, cell)
-                    });
-                    let kept = |kind| {
-                        registers
-                            .rows
-                            .get(&(key.clone(), kind))
-                            .is_some_and(|guard| guard.hlc > ts.hlc)
+                    .map(|k| sheet.index.rows.position_of(k))
+                    .collect();
+                sheet.index.rows.remove_keys_at(keys, ts.hlc);
+                // The delete is one more write per register: it takes what it outranks and leaves
+                // what a newer write already claimed.
+                let kept = |registers: &SheetRegisters, key: &FractionalKey, kind| {
+                    registers
+                        .rows
+                        .get(&(key.clone(), kind))
+                        .is_some_and(|guard| guard.hlc > ts.hlc)
+                };
+                // A row that went hidden takes its record along, by the position it had.
+                for (key, before) in ids.iter().zip(&before) {
+                    let Some(p) = before else {
+                        continue;
                     };
-                    if let Ok(at) = sheet.rows.binary_search_by(|row| row.r.cmp(key)) {
-                        let row = &mut sheet.rows[at];
-                        row.s = filter_styles(styles, row.s, kept);
-                        row.custom_format = row.s != 0;
-                        if !kept(PropKind::Height) {
-                            row.height = DEFAULT_ROW_HEIGHT / ROW_HEIGHT_FACTOR;
-                            row.custom_height = false;
+                    if sheet.index.rows.position_of(key).is_some() {
+                        continue;
+                    }
+                    let r = *p as i32 + 1;
+                    let Ok(at) = sheet.rows.binary_search_by_key(&r, |row| row.r) else {
+                        continue;
+                    };
+                    let mut row = sheet.rows.remove(at);
+                    filter_row(styles, &mut row, |k| kept(&sheet.index.registers, key, k));
+                    if !row.is_empty() {
+                        // No position while hidden; 0 keeps replicas byte-identical.
+                        row.r = 0;
+                        sheet.index.hidden_rows.insert(key.clone(), row);
+                    }
+                }
+                // A hidden row holds no cell newer than the delete: its store row goes whole.
+                sheet.apply_reorder(Axis::Rows);
+                for (key, before) in ids.iter().zip(&before) {
+                    let registers = &sheet.index.registers;
+                    match sheet.index.rows.position_of(key) {
+                        Some(row) => {
+                            let row = row as i32 + 1;
+                            for column in sheet.sheet_data.columns_in_row(row) {
+                                retain_cell(sheet, styles, (row, column), ts.hlc);
+                            }
+                            let registers = &sheet.index.registers;
+                            let Ok(at) = sheet.rows.binary_search_by_key(&row, |r| r.r) else {
+                                continue;
+                            };
+                            filter_row(styles, &mut sheet.rows[at], |k| kept(registers, key, k));
+                            if sheet.rows[at].is_empty() {
+                                sheet.rows.remove(at);
+                            }
                         }
-                        if !kept(PropKind::Hidden) {
-                            row.hidden = false;
+                        // Hidden before this delete too: the record waiting for it is filtered
+                        // all the same, as a write arriving after the delete would be refused.
+                        None if before.is_none() => {
+                            let Some(row) = sheet.index.hidden_rows.get_mut(key) else {
+                                continue;
+                            };
+                            filter_row(styles, row, |k| kept(registers, key, k));
+                            if row.is_empty() {
+                                sheet.index.hidden_rows.remove(key);
+                            }
                         }
-                        if row.is_empty() {
-                            sheet.rows.remove(at);
-                        }
+                        None => {}
                     }
                 }
             }
@@ -1035,43 +1464,54 @@ impl CollabModel<'_> {
                     worksheets, styles, ..
                 } = &mut self.workbook;
                 let sheet = &mut worksheets[i];
+                Stable::drop_spills(sheet);
                 sheet.index.cols.remove_keys_at(keys, ts.hlc);
+                sheet.apply_reorder(Axis::Columns);
                 let ids = identities(&sheet.index.cols, keys);
-                self.local.revived |= ids
+                // Spans are regions, not sets of columns: what they cover resolves against the
+                // index, which just shrank. Cells of a column still visible go one by one.
+                let columns: Vec<i32> = ids
                     .iter()
-                    .any(|k| sheet.index.cols.position_of(k).is_some());
-                for key in &ids {
-                    let registers = &sheet.index.registers;
-                    sheet.sheet_data.retain_col(key, |row_key, cell| {
-                        keep_cell(
-                            registers,
-                            styles,
-                            &(row_key.clone(), key.clone()),
-                            ts.hlc,
-                            cell,
-                        )
-                    });
-                    // Spans are regions, not sets of columns: what they cover resolves against the
-                    // index, which just shrank.
+                    .filter_map(|k| sheet.index.cols.position_of(k))
+                    .map(|c| c as i32 + 1)
+                    .collect();
+                if !columns.is_empty() {
+                    for row in sheet.sheet_data.rows() {
+                        for &column in &columns {
+                            retain_cell(sheet, styles, (row, column), ts.hlc);
+                        }
+                    }
                 }
             }
             Patch::MoveRows { sheet, moves, .. } => {
                 let Some(i) = self.sheet_index(*sheet) else {
                     return Ok(());
                 };
-                let index = &mut self.workbook.worksheets[i].index;
+                let sheet = &mut self.workbook.worksheets[i];
+                Stable::drop_spills(sheet);
                 for (source, dest) in moves {
-                    index.rows.apply_move(source, dest.clone(), ts.hlc);
+                    sheet.index.rows.apply_move(source, dest.clone(), ts.hlc);
+                }
+                sheet.apply_reorder(Axis::Rows);
+                // A move revives a hidden row.
+                if !sheet.index.hidden_rows.is_empty() {
+                    let sources: Vec<FractionalKey> =
+                        moves.iter().map(|(s, _)| s.clone()).collect();
+                    for key in identities(&sheet.index.rows, &sources) {
+                        unhide_row(sheet, &key);
+                    }
                 }
             }
             Patch::MoveColumns { sheet, moves, .. } => {
                 let Some(i) = self.sheet_index(*sheet) else {
                     return Ok(());
                 };
-                let index = &mut self.workbook.worksheets[i].index;
+                let sheet = &mut self.workbook.worksheets[i];
+                Stable::drop_spills(sheet);
                 for (source, dest) in moves {
-                    index.cols.apply_move(source, dest.clone(), ts.hlc);
+                    sheet.index.cols.apply_move(source, dest.clone(), ts.hlc);
                 }
+                sheet.apply_reorder(Axis::Columns);
             }
             Patch::SetRowProperty {
                 sheet,
@@ -1092,23 +1532,21 @@ impl CollabModel<'_> {
                     return Ok(());
                 }
                 let own = self.workbook.worksheets[i]
-                    .rows
-                    .iter()
-                    .find(|r| &r.r == row)
+                    .row_by_key(row)
                     .filter(|r| r.custom_format)
                     .map_or(0, |r| r.s);
                 let s = overlay(&mut self.workbook.styles, own, &won);
-                let record = row_record(&mut self.workbook.worksheets[i], row);
-                record.s = s;
-                record.custom_format = s != 0;
+                let row = self.workbook.worksheets[i].row_mut(row);
+                row.s = s;
+                row.custom_format = s != 0;
                 // A row has no width; the kinds it does not own are simply skipped.
                 for property in won {
                     match property {
                         Property::Height(height) => {
-                            record.height = *height;
-                            record.custom_height = true;
+                            row.height = *height;
+                            row.custom_height = true;
                         }
-                        Property::Hidden(hidden) => record.hidden = *hidden,
+                        Property::Hidden(hidden) => row.hidden = *hidden,
                         _ => {}
                     }
                 }
@@ -1129,14 +1567,10 @@ impl CollabModel<'_> {
                 if won.is_empty() {
                     return Ok(());
                 }
-                let own = self.workbook.worksheets[i]
-                    .cols
-                    .iter()
-                    .find(|c| (&c.min, &c.max) == (&span.0, &span.1))
-                    .and_then(|c| c.style)
-                    .unwrap_or(0);
+                let index = &mut self.workbook.worksheets[i].index;
+                let own = index.col_spans.get(span).and_then(|c| c.style).unwrap_or(0);
                 let s = overlay(&mut self.workbook.styles, own, &won);
-                let record = col_record(&mut self.workbook.worksheets[i], span);
+                let record = index.col_spans.entry(span.clone()).or_default();
                 record.style = (s != 0).then_some(s);
                 // A column has no height; the kinds it does not own are simply skipped.
                 for property in won {
@@ -1159,15 +1593,14 @@ impl CollabModel<'_> {
                 let Some(i) = self.sheet_index(*sheet) else {
                     return Ok(());
                 };
-                let sheet = &mut self.workbook.worksheets[i];
-                if !wins(&mut sheet.index.registers.merges, range, ts) {
+                let index = &mut self.workbook.worksheets[i].index;
+                if !wins(&mut index.registers.merges, range, ts) {
                     return Ok(());
                 }
-                let at = sheet.merged_cells.iter().position(|r| r == range);
-                match (merged, at) {
-                    (true, None) => sheet.merged_cells.push(range.clone()),
-                    (false, Some(at)) => {
-                        sheet.merged_cells.remove(at);
+                match (merged, index.merges.binary_search(range)) {
+                    (true, Err(at)) => index.merges.insert(at, range.clone()),
+                    (false, Ok(at)) => {
+                        index.merges.remove(at);
                     }
                     _ => {}
                 }
@@ -1178,18 +1611,17 @@ impl CollabModel<'_> {
                 let Some(i) = self.sheet_index(*sheet) else {
                     return Ok(());
                 };
-                let sheet = &mut self.workbook.worksheets[i];
-                if !wins(&mut sheet.index.registers.comments, at, ts) {
+                let index = &mut self.workbook.worksheets[i].index;
+                if !wins(&mut index.registers.comments, at, ts) {
                     return Ok(());
                 }
-                let found = sheet.comments.iter().position(|c| &c.cell_ref == at);
-                match (comment, found) {
-                    (Some(comment), Some(at)) => sheet.comments[at] = comment.clone(),
-                    (Some(comment), None) => sheet.comments.push(comment.clone()),
-                    (None, Some(at)) => {
-                        sheet.comments.remove(at);
+                match comment {
+                    Some(comment) => {
+                        index.comments.insert(at.clone(), comment.clone());
                     }
-                    (None, None) => {}
+                    None => {
+                        index.comments.remove(at);
+                    }
                 }
             }
             Patch::SetCellLink {
@@ -1199,21 +1631,21 @@ impl CollabModel<'_> {
                     return Ok(());
                 };
                 let id = self.workbook.worksheets[i].sheet_id;
-                let sheet = &mut self.workbook.worksheets[i];
-                if !wins(&mut sheet.index.registers.links, at, ts) {
+                let index = &mut self.workbook.worksheets[i].index;
+                if !wins(&mut index.registers.links, at, ts) {
                     return Ok(());
                 }
                 match link {
                     Some(link) => {
-                        sheet.links.insert(at.clone(), link.clone());
+                        index.links.insert(at.clone(), link.clone());
                     }
                     None => {
-                        sheet.links.remove(at);
+                        index.links.remove(at);
                     }
                 }
                 // if link refers to object that was not defined yet, remember it
                 if let Some(StableLink::Internal { location, .. }) = link {
-                    for name in location.text_names() {
+                    for name in location.unresolved_names() {
                         self.local
                             .unresolved
                             .entry(name.to_uppercase())
@@ -1255,23 +1687,28 @@ impl CollabModel<'_> {
                         show_grid_lines: true,
                         conditional_formatting: vec![],
                         links: HashMap::new(),
-                        index: self.new_indexes(),
+                        index: StableIndexes::new(self.suffix()),
                     };
                     self.workbook.worksheets.push(sheet);
+                    self.parsed_formulas.push(Vec::new());
                     if let Some(content) = content {
                         let i = self.workbook.worksheets.len() - 1;
                         self.seed_sheet(i, content, ts)?;
                     }
                 }
                 self.sort_sheets();
+                self.sheet_changed(*id);
             }
             Patch::DeleteSheet { sheet, .. } => {
                 if !wins(&mut self.workbook.meta.sheet_existence, sheet, ts) {
                     return Ok(());
                 }
                 if let Some(i) = self.sheet_index(*sheet) {
+                    let before = self.sheet_ids();
                     self.workbook.worksheets.remove(i);
+                    self.realign_parsed(before);
                 }
+                self.sheet_changed(*sheet);
             }
             Patch::SetSheetProperty {
                 sheet, property, ..
@@ -1298,6 +1735,7 @@ impl CollabModel<'_> {
                 if let SheetProperty::Name(name) = property {
                     // The display name is derived, so a rename only files what the user authored.
                     self.file_sheet_name(*sheet, name, ts);
+                    self.sheet_changed(*sheet);
                     return Ok(());
                 }
                 let registers = &mut self.workbook.worksheets[i].index.registers;
@@ -1320,6 +1758,13 @@ impl CollabModel<'_> {
                 if !wins(&mut self.workbook.meta.props, &property.kind(), ts) {
                     return Ok(());
                 }
+                // The locale drives defined-name parsing; the theme and the name drive nothing lowered.
+                if !matches!(
+                    property,
+                    WorkbookProperty::Theme(_) | WorkbookProperty::Name(_)
+                ) {
+                    self.local.dirty.structural = true;
+                }
                 match property {
                     WorkbookProperty::Theme(theme) => self.workbook.theme = (**theme).clone(),
                     WorkbookProperty::Locale(locale) => {
@@ -1332,6 +1777,10 @@ impl CollabModel<'_> {
             // `Workbook::defined_names` itself is derived from these registers by
             // `normalize_defined_names`.
             Patch::SetDefinedName { id, property, .. } => {
+                let dirty = &mut self.local.dirty;
+                dirty.names.insert(*id);
+                dirty.unbound = true;
+                dirty.structural = true;
                 let state = self.workbook.meta.defined_names.entry(*id).or_default();
                 // Each value guards itself, and the one this patch does not carry keeps the guard
                 // it has — zero for an id first seen here, which any real write then beats.
@@ -1378,8 +1827,10 @@ impl CollabModel<'_> {
                 }
                 let cf_rule = self.install_rule(i, key, rule);
                 let sheet = &mut self.workbook.worksheets[i];
+                sheet.index.cf_ranges.insert(key.clone(), ranges.clone());
+                // The ordinal ranges are derived at the end of the commit.
                 let cf = ConditionalFormatting {
-                    ranges: ranges.clone(),
+                    ranges: Vec::new(),
                     cf_rule,
                     priority: 0,
                 };
@@ -1395,6 +1846,7 @@ impl CollabModel<'_> {
                 if let Some(at) = cf_slot(sheet, key) {
                     sheet.index.registers.cf_order.remove(at);
                     sheet.index.registers.cf_formulas.remove(key);
+                    sheet.index.cf_ranges.remove(key);
                     sheet.conditional_formatting.remove(at);
                     rank_cf(sheet);
                 }
@@ -1440,7 +1892,7 @@ impl CollabModel<'_> {
                         self.workbook.worksheets[i].conditional_formatting[at].cf_rule = cf_rule;
                     }
                     CfProperty::Ranges(ranges) => {
-                        sheet.conditional_formatting[at].ranges = ranges.clone()
+                        sheet.index.cf_ranges.insert(key.clone(), ranges.clone());
                     }
                     CfProperty::Priority(_) => unreachable!("handled above"),
                 }
@@ -1476,10 +1928,14 @@ impl CollabModel<'_> {
     /// Writes `value` into cell `at` of the `i`-th worksheet, `None` clearing it. The style already
     /// on the cell survives — it is a register of its own.
     fn write_cell(&mut self, i: usize, at: &StableCellAddress, value: Option<&CellInput>) {
+        // A key with no position names nothing visible: the write lands in the registers only.
+        let Some((row, column)) = self.workbook.worksheets[i].ordinal(at) else {
+            return;
+        };
+        let sheet = &mut self.workbook.worksheets[i];
         let Some(value) = value else {
-            self.workbook.worksheets[i]
-                .sheet_data
-                .remove_cell(&at.0, &at.1);
+            sheet.sheet_data.remove_cell(row, column);
+            sheet.index.covered.remove(&(row, column));
             return;
         };
         // Interning first: it needs the workbook, the cell needs the sheet.
@@ -1487,12 +1943,23 @@ impl CollabModel<'_> {
             CellInput::Text(text) => self.intern_string(text),
             _ => 0,
         };
+        // A cell that already holds a formula keeps its entry; any other gets a new one.
+        let f = match value {
+            CellInput::Formula(formula)
+            | CellInput::Array(formula)
+            | CellInput::Cse { formula, .. } => {
+                let sheet = &self.workbook.worksheets[i];
+                let held = (sheet.sheet_data.cell(row, column)).and_then(|cell| cell.get_formula());
+                self.lower_entry(i, held, at, (row, column), &formula.refs, &formula.text)
+            }
+            _ => 0,
+        };
         let sheet = &mut self.workbook.worksheets[i];
-        let style = cell_style(sheet, at);
-        let cell = build_cell(sheet, value, style, shared_string);
-        sheet
-            .sheet_data
-            .insert_cell(at.0.clone(), at.1.clone(), cell);
+        let style = sheet.authored_style((row, column)).unwrap_or(0);
+        let cell = build_cell(value, style, shared_string, f);
+        sheet.sheet_data.set_cell(row, column, cell);
+        // A spill the value replaced covers nothing any more.
+        sheet.index.covered.remove(&(row, column));
         // use [CollabSession::unresolved] to remember the names of object that couldn't be mapped
         // to their IDs
         if let CellInput::Formula(formula)
@@ -1500,7 +1967,7 @@ impl CollabModel<'_> {
         | CellInput::Cse { formula, .. } = value
         {
             let id = self.workbook.worksheets[i].sheet_id;
-            for name in formula.text_names() {
+            for name in formula.unresolved_names() {
                 self.local
                     .unresolved
                     .entry(name.to_uppercase())
@@ -1515,14 +1982,20 @@ impl CollabModel<'_> {
     fn index_unresolved(&mut self) {
         self.local.unresolved.clear();
         for sheet in &self.workbook.worksheets {
-            for (row_key, column_key, cell) in sheet.sheet_data.cells() {
+            for (row, column, cell) in sheet.sheet_data.cells() {
                 let Some(f) = cell.get_formula() else {
                     continue;
                 };
-                let Some(formula) = sheet.shared_formulas.get(f as usize) else {
+                let (Some(row_key), Some(column_key)) = (
+                    sheet.index.rows.key(row as usize - 1),
+                    sheet.index.cols.key(column as usize - 1),
+                ) else {
                     continue;
                 };
-                for name in formula.text_names() {
+                let Some(entry) = sheet.index.formulas.get(f as usize) else {
+                    continue;
+                };
+                for name in unresolved_names(&entry.refs) {
                     self.local
                         .unresolved
                         .entry(name.to_uppercase())
@@ -1530,11 +2003,11 @@ impl CollabModel<'_> {
                         .insert((sheet.sheet_id, (row_key.clone(), column_key.clone())));
                 }
             }
-            for (at, link) in &sheet.links {
+            for (at, link) in &sheet.index.links {
                 let StableLink::Internal { location, .. } = link else {
                     continue;
                 };
-                for name in location.text_names() {
+                for name in location.unresolved_names() {
                     self.local
                         .unresolved
                         .entry(name.to_uppercase())
@@ -1586,8 +2059,8 @@ impl CollabModel<'_> {
                 for (at, _) in &content.cell_styles {
                     cells.push(at);
                 }
-                for comment in &content.comments {
-                    cells.push(&comment.cell_ref)
+                for (at, _) in &content.comments {
+                    cells.push(at);
                 }
                 for (at, _) in &content.links {
                     cells.push(at);
@@ -1605,7 +2078,9 @@ impl CollabModel<'_> {
                     .chain(cols.into_iter().cloned())
                     .collect();
                 sheet.index.rows.insert_keys_at(&rows, ts.hlc);
+                sheet.apply_reorder(Axis::Rows);
                 sheet.index.cols.insert_keys_at(&cols, ts.hlc);
+                sheet.apply_reorder(Axis::Columns);
             }
         }
 
@@ -1641,12 +2116,15 @@ impl CollabModel<'_> {
                     .cell_styles
                     .insert((at.clone(), kind), *ts);
             }
-            match sheet.sheet_data.cell_mut(&at.0, &at.1) {
+            let Some((row, column)) = sheet.ordinal(at) else {
+                continue;
+            };
+            match sheet.sheet_data.cell_mut(row, column) {
                 Some(cell) => cell.set_style(s),
                 None => {
                     sheet
                         .sheet_data
-                        .insert_cell(at.0.clone(), at.1.clone(), Cell::EmptyCell { s });
+                        .set_cell(row, column, Cell::EmptyCell { s });
                 }
             }
         }
@@ -1672,27 +2150,23 @@ impl CollabModel<'_> {
         }
 
         let sheet = &mut self.workbook.worksheets[i];
+        let index = &mut sheet.index;
         for range in &content.merge_cells {
-            sheet.index.registers.merges.insert(range.clone(), *ts);
-            sheet.merged_cells.push(range.clone());
+            index.registers.merges.insert(range.clone(), *ts);
+            index.merges.push(range.clone());
         }
-        for comment in &content.comments {
-            sheet
-                .index
-                .registers
-                .comments
-                .insert(comment.cell_ref.clone(), *ts);
-            sheet.comments.push(comment.clone());
+        // The payload is ordered, but nothing stops a peer from sending it otherwise.
+        index.merges.sort();
+        index.merges.dedup();
+        for (at, comment) in &content.comments {
+            index.registers.comments.insert(at.clone(), *ts);
+            index.comments.insert(at.clone(), comment.clone());
         }
         for (at, link) in &content.links {
-            sheet.index.registers.links.insert(at.clone(), *ts);
-            sheet.links.insert(at.clone(), link.clone());
+            index.registers.links.insert(at.clone(), *ts);
+            index.links.insert(at.clone(), link.clone());
         }
-        // The payload is ordered by key, but nothing stops a peer from sending it otherwise.
-        sheet.rows.sort_by(|a, b| a.r.cmp(&b.r));
-        sheet
-            .cols
-            .sort_by(|a, b| (&a.min, &a.max).cmp(&(&b.min, &b.max)));
+        sheet.rows.sort_by_key(|row| row.r);
 
         for (key, state) in &content.conditional_formatting {
             let cf_rule = self.install_rule(i, key, &state.rule);
@@ -1707,8 +2181,12 @@ impl CollabModel<'_> {
                     .or_default()
                     .merge(position.clone(), ts); // resolve potential conflicting position changes
             }
+            sheet
+                .index
+                .cf_ranges
+                .insert(key.clone(), state.ranges.clone());
             let cf = ConditionalFormatting {
-                ranges: state.ranges.clone(),
+                ranges: Vec::new(),
                 cf_rule,
                 priority: 0,
             };
@@ -1725,7 +2203,7 @@ impl CollabModel<'_> {
             let StableLink::Internal { location, .. } = link else {
                 continue;
             };
-            for name in location.text_names() {
+            for name in location.unresolved_names() {
                 self.local
                     .unresolved
                     .entry(name.to_uppercase())
@@ -1733,6 +2211,7 @@ impl CollabModel<'_> {
                     .insert((id, at.clone()));
             }
         }
+        self.derive_sparse(i);
         Ok(())
     }
 
@@ -1763,14 +2242,24 @@ impl CollabModel<'_> {
                 sheet.index.registers.rows.insert((key.clone(), kind), *ts);
             }
         }
-        sheet.rows.push(Row {
-            r: key.clone(),
+        let row = Row {
+            r: 0,
             height: state.height,
             custom_format: state.custom_format,
             custom_height: state.custom_height,
             s,
             hidden: state.hidden,
-        });
+        };
+        // A full index seed (a sheet copy, a restore) carries hidden rows too.
+        match sheet.index.rows.position_of(key) {
+            Some(p) => sheet.rows.push(Row {
+                r: p as i32 + 1,
+                ..row
+            }),
+            None => {
+                sheet.index.hidden_rows.insert(key.clone(), row);
+            }
+        }
     }
 
     fn seed_column(
@@ -1805,14 +2294,15 @@ impl CollabModel<'_> {
                     .insert((span.clone(), kind), *ts);
             }
         }
-        sheet.cols.push(Col {
-            min: span.0.clone(),
-            max: span.1.clone(),
-            width: state.width,
-            custom_width: state.custom_width,
-            hidden: state.hidden,
-            style,
-        });
+        sheet.index.col_spans.insert(
+            span.clone(),
+            ColSpan {
+                width: state.width,
+                custom_width: state.custom_width,
+                hidden: state.hidden,
+                style,
+            },
+        );
     }
 }
 
@@ -1821,9 +2311,11 @@ mod test {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::cf_types::CfRule;
+    use crate::collab::model::CommentBody;
     use crate::collab::model::StableRange;
     use crate::collab::patch::DefinedNameBody;
-    use crate::types::{Color, Comment, Position, Theme};
+    use crate::constants::{COLUMN_WIDTH_FACTOR, DEFAULT_COLUMN_WIDTH};
+    use crate::types::{Color, RangeRef, Theme};
 
     /// Method-syntax delivery, chainable straight off [`rec`].
     trait Deliver {
@@ -1896,7 +2388,11 @@ mod test {
 
     fn cell(model: &CollabModel<'_>, row: &FractionalKey, col: &FractionalKey) -> Option<Cell> {
         let sheet = model.workbook.worksheets.first()?;
-        sheet.sheet_data.cell(row, col).cloned()
+        let (row, column) = sheet.ordinal(&(row.clone(), col.clone()))?;
+        sheet
+            .sheet_data
+            .cell(row, column)
+            .map(|cell| cell.into_owned())
     }
 
     /// A sheet with three rows and three columns, as commit 1.
@@ -2013,12 +2509,12 @@ mod test {
             rows: Some((rows[0].clone(), rows[1].clone())),
             cols: Some((cols[0].clone(), cols[1].clone())),
         };
-        let comment = Comment::<Stable> {
+        let comment = CommentBody {
             text: "look".to_string(),
             author_name: "me".to_string(),
             author_id: None,
-            cell_ref: (rows[1].clone(), cols[1].clone()),
         };
+        let comment_at = (rows[1].clone(), cols[1].clone());
         let cf_key = minted(&[0x20], 1);
         let name_body = DefinedNameBody {
             formula: model.bind_text(0, 1, 1, "Sheet1!$A$1"),
@@ -2075,7 +2571,7 @@ mod test {
                 },
                 Patch::SetComment {
                     sheet: SHEET,
-                    at: comment.cell_ref.clone(),
+                    at: comment_at.clone(),
                     comment: Some(comment.clone()),
                     prev: None,
                 },
@@ -2138,22 +2634,60 @@ mod test {
             styled()
         );
         assert_eq!(sheet.rows.len(), 1);
-        assert_eq!(sheet.rows[0].r, rows[0]);
+        assert_eq!(sheet.rows[0].r, 1); // the ordinal rows[0] sits at
         assert_eq!(sheet.rows[0].height, 33.0);
         assert!(sheet.rows[0].custom_height);
-        // Records are kept sorted by span, so the open-ended one comes first.
-        assert_eq!(sheet.cols.len(), 2);
-        assert_eq!(sheet.cols[1].width, 120.0);
-        assert_eq!(sheet.cols[0].min, FractionalKey::NULL);
-        assert!(sheet.cols[0].hidden);
-        assert_eq!(sheet.cols[0].resolve(&sheet.index), Some((1, 3)));
+        // Each span keeps its state; the records are what the spans resolve to, the open-ended one
+        // covering every column, those past the index's tail included.
+        assert_eq!(sheet.index.col_spans.len(), 2);
+        assert_eq!(
+            sheet.index.col_spans[&(cols[0].clone(), cols[1].clone())].width,
+            120.0
+        );
+        assert!(sheet.index.col_spans[&(FractionalKey::NULL, FractionalKey::NULL)].hidden);
+        let hidden = |min, max, width, custom_width| Col {
+            min,
+            max,
+            width,
+            custom_width,
+            hidden: true,
+            style: None,
+        };
+        let default_width = DEFAULT_COLUMN_WIDTH / COLUMN_WIDTH_FACTOR;
+        assert_eq!(
+            sheet.cols,
+            vec![
+                hidden(1, 2, 120.0, true),
+                hidden(3, LAST_COLUMN, default_width, false)
+            ]
+        );
         assert_eq!(sheet.name, "Renamed");
         assert_eq!(sheet.color, Color::Rgb("#ff0000".to_string()));
-        assert_eq!(sheet.merged_cells, vec![merged.clone()]);
-        assert_eq!(sheet.comments, vec![comment.clone()]);
+        assert_eq!(sheet.index.merges, vec![merged.clone()]);
+        let merged_cell = MergedCell {
+            row: 1,
+            column: 1,
+            width: 2,
+            height: 2,
+        };
+        assert_eq!(sheet.merged_cells, vec![merged_cell]);
+        assert_eq!(sheet.index.comments[&comment_at], comment);
+        assert_eq!(
+            sheet.comments,
+            vec![Comment {
+                text: "look".to_string(),
+                author_name: "me".to_string(),
+                author_id: None,
+                cell_ref: (2, 2),
+            }]
+        );
         assert_eq!(sheet.conditional_formatting.len(), 1);
         assert_eq!(sheet.conditional_formatting[0].cf_rule, cf_stored("A1>5"));
-        assert_eq!(sheet.conditional_formatting[0].ranges, vec![merged.clone()]);
+        assert_eq!(sheet.index.cf_ranges[&cf_key], vec![merged.clone()]);
+        assert_eq!(
+            sheet.conditional_formatting[0].ranges,
+            vec![RangeRef::from(&merged_cell)]
+        );
         assert_eq!(sheet.conditional_formatting[0].priority, 1);
         assert_eq!(sheet.index.registers.cf_order, vec![cf_key.clone()]);
         assert_eq!(model.workbook.defined_names.len(), 1);
@@ -2280,12 +2814,24 @@ mod test {
         // The moved row answers to the key it was minted as, at its new position.
         assert_eq!(Stable::row_ordinal(&sheet.index, &rows[0]), Some(2));
         assert_eq!(Stable::row_ordinal(&sheet.index, &rows[2]), Some(1));
-        // ...and its cells never moved: they are filed under identity, not position.
-        assert_eq!(sheet.sheet_data.row_cells(&rows[0]).count(), 1);
+        // ...and its cells moved with it.
+        let text = |row: &FractionalKey| match cell(&model, row, &cols[0]) {
+            Some(Cell::SharedString { si, .. }) => model.workbook.shared_strings.get(si as usize),
+            _ => None,
+        };
+        assert_eq!(sheet.sheet_data.cells_in_row(2).len(), 1);
+        assert_eq!(
+            text(&rows[0]),
+            Some(&format!("{:?}/{:?}", rows[0], cols[0]))
+        );
+        assert_eq!(
+            text(&rows[2]),
+            Some(&format!("{:?}/{:?}", rows[2], cols[0]))
+        );
         // The deleted row and column took their cells with them.
         assert_eq!(Stable::row_ordinal(&sheet.index, &rows[1]), None);
-        assert!(!sheet.sheet_data.rows().any(|(row, _)| row == &rows[1]));
-        assert_eq!(sheet.sheet_data.col_cells(&cols[1]).count(), 0);
+        assert_eq!(sheet.sheet_data.rows(), vec![1, 2]);
+        assert!(sheet.sheet_data.cells().all(|(_, column, _)| column == 1));
         assert_eq!(sheet.index.rows.len(), 2);
         assert_eq!(sheet.index.cols.len(), 1);
 
@@ -2528,8 +3074,8 @@ mod test {
         // 1..4 are hidden — which a width read reports as 0 — so the register is what has to be
         // compared to see which span won the width.
         let width = |m: &CollabModel, column: i32| {
-            m.workbook.worksheets[0]
-                .covering_col(column, PropKind::Width)
+            (m.workbook.worksheets[0].cols.iter())
+                .find(|col| (col.min..=col.max).contains(&column))
                 .map(|col| col.width)
         };
         assert_eq!(width(&a, 1), width(&a, 3));

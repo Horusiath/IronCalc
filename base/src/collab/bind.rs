@@ -1,35 +1,40 @@
-//! The two conversions between the ordinal formula AST and the stable token stream.
+//! The two conversions between a parsed formula and its stable form.
+//!
+//! A formula is stored and shipped as its R1C1 English text plus one slot per reference-shaped
+//! leaf of its parse tree, in pre-order. Binding walks the parsed node and keys each leaf; lowering
+//! parses the text for its shape and overwrites each leaf from its slot against the index.
 //!
 //! Both walks are iterative with an explicit stack: formula depth is author-controlled, so
 //! recursing over a `Node` tree is a stack overflow waiting to happen.
 
 use std::cell::OnceCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use crate::collab::formula::{
-    ArrayValue, FormulaError, LambdaParam, StableAxisRef, StableFormula, StableSheetRef,
-    StableToken,
-};
-use crate::collab::model::{CollabModel, SheetIndexes, Stable};
+use crate::collab::formula::{StableAxisRef, StableFormula, StableRef, StableSheetRef};
+use crate::collab::fractional_index::FractionalIndex;
+use crate::collab::fractional_key::FractionalKey;
+use crate::collab::model::{CollabModel, Stable, StableIndexes};
 use crate::collab::patch::{DefinedNameId, Patch, SheetId};
 use crate::constants::{LAST_COLUMN, LAST_ROW};
-use crate::expressions::parser::{ArrayNode, NamedVariable, Node};
+use crate::expressions::lexer::LexerMode;
+use crate::expressions::parser::stringify::to_rc_format;
+use crate::expressions::parser::{Node, Parser};
 use crate::expressions::token;
-use crate::types::Position;
+use crate::expressions::types::CellReferenceRC;
+use crate::language::get_default_language;
+use crate::locale::get_default_locale;
 
-/// Per-`lower` scratch: the defined-name display list, built lazily and reused across tokens.
+/// Per-lowering scratch: the defined-name display list, built lazily and reused across leaves.
 type DisplayNameCache = OnceCell<Vec<(DefinedNameId, Option<SheetId>, String)>>;
 
 /// Why a `Node` has no stable form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindError {
-    /// A reference names a sheet that does not exist, or a row/column off the materialized grid.
+    /// A reference names a sheet that does not exist, or a row/column off the grid.
     UnboundReference,
     /// A name with no live defined-name entry to point at.
     UnresolvedDefinedName(String),
-    /// Defensive: the emitted stream did not pass the validator.
-    Invalid(FormulaError),
 }
 
 impl fmt::Display for BindError {
@@ -39,44 +44,21 @@ impl fmt::Display for BindError {
             BindError::UnresolvedDefinedName(name) => {
                 write!(f, "defined name \"{name}\" not found")
             }
-            BindError::Invalid(err) => write!(f, "bound stream is not a formula: {err}"),
         }
     }
 }
 
 impl std::error::Error for BindError {}
 
-/// Why a token stream has no ordinal form.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LowerError {
-    Invalid(FormulaError),
-    /// Defensive: a validated stream ran the operand stack dry.
-    Corrupt,
-    /// The host sheet the stream is lowered against does not exist.
-    UnknownHostSheet(u32),
-}
-
-impl fmt::Display for LowerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LowerError::Invalid(err) => write!(f, "not a formula: {err}"),
-            LowerError::Corrupt => write!(f, "validated stream underflowed the operand stack"),
-            LowerError::UnknownHostSheet(sheet) => write!(f, "host sheet '{sheet}' does not exist"),
-        }
-    }
-}
-
-impl std::error::Error for LowerError {}
-
-/// What one step of the bind walk owes: visit a node's children, or emit its own token.
-enum Step<'a> {
-    Visit(&'a Node),
-    Emit(&'a Node),
-}
-
 /// What a `Wrong*` node's dead axis carries: absolute ordinal 0, which upstream both renders and
 /// evaluates as `#REF!`.
 const DEAD_AXIS: (bool, i32) = (true, 0);
+
+/// The axis of an open range (`A:A`, `5:7`): no key, the grid's first or last row or column.
+const OPEN_AXIS: StableAxisRef = StableAxisRef {
+    key: FractionalKey::NULL,
+    absolute: true,
+};
 
 /// Rows and columns that sheets have not materialized yet (but they were referenced by formulas).
 /// Each `rows`/`cols` is a pair of (sheet-id, highest-referenced-row (or column)).
@@ -93,40 +75,164 @@ impl MintPlan {
     }
 }
 
-/// Where a stream is lowered against: the cell whose offsets it resolves relative to, or — when
-/// `absolute` — no cell at all, every reference coming back as an ordinal.
+/// The cell a formula is lowered against: relative references come back as offsets from it.
 pub struct Host {
-    sheet: u32,
-    row: i32,
-    column: i32,
-    absolute: bool,
+    pub sheet: u32,
+    pub row: i32,
+    pub column: i32,
 }
 
 impl Host {
-    /// Relative cell address point of reference (using `$` for cell address).
     pub fn relative(sheet: u32, row: i32, column: i32) -> Self {
-        Host {
-            sheet,
-            row,
-            column,
-            absolute: false,
-        }
+        Host { sheet, row, column }
     }
+}
 
-    /// Absolute cell address point of reference (e.g. `=A1`).
-    pub fn absolute(sheet: u32) -> Self {
-        Host {
-            sheet,
-            row: 1,
-            column: 1,
-            absolute: true,
+/// Whether `node` gets a slot. Whether a sheet or a name resolves only picks one of each pair, so a
+/// text has the same leaves on every replica.
+fn is_leaf(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::ReferenceKind { .. }
+            | Node::WrongReferenceKind { .. }
+            | Node::RangeKind { .. }
+            | Node::WrongRangeKind { .. }
+            | Node::DefinedNameKind(_)
+            | Node::NamedVariableKind { .. }
+    )
+}
+
+/// The reference-shaped leaves of `node`, in pre-order.
+pub(crate) fn leaves(node: &Node) -> Vec<&Node> {
+    let mut out = Vec::new();
+    let mut stack = vec![node];
+    // Children are pushed last-first so the stack pops them left to right.
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::OpRangeKind { left, right }
+            | Node::OpConcatenateKind { left, right }
+            | Node::OpSumKind { left, right, .. }
+            | Node::OpProductKind { left, right, .. }
+            | Node::OpPowerKind { left, right }
+            | Node::CompareKind { left, right, .. } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            Node::UnaryKind { right, .. } => stack.push(right),
+            Node::ImplicitIntersection { child, .. } | Node::SpillRangeOperator { child } => {
+                stack.push(child)
+            }
+            Node::LambdaDefKind { body, .. } => stack.push(body),
+            Node::FunctionKind { args, .. } | Node::NamedFunctionKind { args, .. } => {
+                stack.extend(args.iter().rev())
+            }
+            Node::LambdaCallKind { lambda, args } => {
+                stack.extend(args.iter().rev());
+                stack.push(lambda);
+            }
+            leaf if is_leaf(leaf) => out.push(leaf),
+            _ => {}
         }
     }
+    out
+}
+
+/// [`leaves`], for overwriting them.
+pub(crate) fn leaves_mut(node: &mut Node) -> Vec<&mut Node> {
+    let mut out = Vec::new();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::OpRangeKind { left, right }
+            | Node::OpConcatenateKind { left, right }
+            | Node::OpSumKind { left, right, .. }
+            | Node::OpProductKind { left, right, .. }
+            | Node::OpPowerKind { left, right }
+            | Node::CompareKind { left, right, .. } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            Node::UnaryKind { right, .. } => stack.push(right),
+            Node::ImplicitIntersection { child, .. } | Node::SpillRangeOperator { child } => {
+                stack.push(child)
+            }
+            Node::LambdaDefKind { body, .. } => stack.push(body),
+            Node::FunctionKind { args, .. } | Node::NamedFunctionKind { args, .. } => {
+                stack.extend(args.iter_mut().rev())
+            }
+            Node::LambdaCallKind { lambda, args } => {
+                stack.extend(args.iter_mut().rev());
+                stack.push(lambda);
+            }
+            leaf if is_leaf(leaf) => out.push(leaf),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Parses stored text — R1C1, English — for its shape only. A parser that knows the host sheet and
+/// nothing else: the leaves are overwritten from their slots anyway, and a parse that read the
+/// replica's sheet and name tables would give `LAMBDA(a, …)` a different shape wherever a name `a`
+/// is defined.
+pub(crate) fn parse_shape(text: &str, sheet: &str, row: i32, column: i32) -> Node {
+    let mut parser = Parser::new(
+        vec![sheet.to_string()],
+        vec![],
+        HashMap::new(),
+        get_default_locale(),
+        get_default_language(),
+    );
+    parser.set_lexer_mode(LexerMode::R1C1);
+    let context = CellReferenceRC {
+        sheet: sheet.to_string(),
+        row,
+        column,
+    };
+    parser.parse(text, &context)
+}
+
+/// An axis' `(absolute, value)` pair: an ordinal when absolute, else an offset from `host`. `None`
+/// when the key has no active position.
+fn lower_axis(index: &FractionalIndex, axis: &StableAxisRef, host: i32) -> Option<(bool, i32)> {
+    let ordinal = index.position_of(&axis.key)? as i32 + 1;
+    Some(match axis.absolute {
+        true => (true, ordinal),
+        false => (false, ordinal - host),
+    })
+}
+
+fn lower_span(
+    index: &FractionalIndex,
+    last: i32,
+    lo: &StableAxisRef,
+    hi: &StableAxisRef,
+    host: i32,
+) -> [Option<(bool, i32)>; 2] {
+    // TODO: eventually we want to narrow the scope of range refs that have no matching stable refs
+    //       to the closest matching position (like Excel does)
+    let corner = |axis: &StableAxisRef, open: i32| {
+        let ordinal = match axis.key.is_empty() {
+            true => open,
+            false => index.position_of(&axis.key)? as i32 + 1,
+        };
+        Some((ordinal, axis.absolute))
+    };
+    let (first, second) = match (corner(lo, 1), corner(hi, last)) {
+        // Concurrent moves can invert the corners; the span they bound is still the same one.
+        (Some(a), Some(b)) if a.0 > b.0 => (Some(b), Some(a)),
+        corners => corners,
+    };
+    let relative = |(ordinal, absolute): (i32, bool)| match absolute {
+        true => (true, ordinal),
+        false => (false, ordinal - host),
+    };
+    [first.map(relative), second.map(relative)]
 }
 
 impl CollabModel<'_> {
     /// The ordering context of worksheet `at`, if it is live.
-    fn indexes(&self, at: u32) -> Option<&SheetIndexes> {
+    fn indexes(&self, at: u32) -> Option<&StableIndexes> {
         self.workbook
             .worksheets
             .get(at as usize)
@@ -160,48 +266,21 @@ impl CollabModel<'_> {
         host_column: i32,
         plan: &mut MintPlan,
     ) -> Result<StableFormula, BindError> {
-        let mut work = vec![Step::Visit(node)];
-        let mut tokens = Vec::new();
-        while let Some(step) = work.pop() {
-            let node = match step {
-                // Children are pushed last-first so the stack pops them left to right.
-                Step::Visit(node) => {
-                    work.push(Step::Emit(node));
-                    match node {
-                        Node::OpRangeKind { left, right }
-                        | Node::OpConcatenateKind { left, right }
-                        | Node::OpSumKind { left, right, .. }
-                        | Node::OpProductKind { left, right, .. }
-                        | Node::OpPowerKind { left, right }
-                        | Node::CompareKind { left, right, .. } => {
-                            work.push(Step::Visit(right));
-                            work.push(Step::Visit(left));
-                        }
-                        Node::UnaryKind { right, .. } => work.push(Step::Visit(right)),
-                        Node::ImplicitIntersection { child, .. }
-                        | Node::SpillRangeOperator { child } => work.push(Step::Visit(child)),
-                        Node::LambdaDefKind { body, .. } => work.push(Step::Visit(body)),
-                        Node::FunctionKind { args, .. } | Node::NamedFunctionKind { args, .. } => {
-                            work.extend(args.iter().rev().map(Step::Visit));
-                        }
-                        Node::LambdaCallKind { lambda, args } => {
-                            work.extend(args.iter().rev().map(Step::Visit));
-                            work.push(Step::Visit(lambda));
-                        }
-                        // Unparseable text is stored verbatim, alone.
-                        Node::ParseErrorKind { formula, .. } => {
-                            return StableFormula::new(vec![StableToken::RawText(formula.clone())])
-                                .map_err(BindError::Invalid);
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-                Step::Emit(node) => node,
-            };
-            tokens.push(self.bind_token(node, host_sheet, host_row, host_column, plan)?);
+        // Unparseable text is stored verbatim, with nothing to key.
+        if let Node::ParseErrorKind { formula, .. } = node {
+            return Ok(StableFormula {
+                text: formula.clone(),
+                refs: Vec::new(),
+            });
         }
-        StableFormula::new(tokens).map_err(BindError::Invalid)
+        let refs = leaves(node)
+            .into_iter()
+            .map(|leaf| self.bind_leaf(leaf, host_sheet, host_row, host_column, plan))
+            .collect::<Result<_, _>>()?;
+        Ok(StableFormula {
+            text: to_rc_format(node),
+            refs,
+        })
     }
 
     /// The `InsertRows`/`InsertColumns` to create rows/columns required by formula bind.
@@ -293,18 +372,16 @@ impl CollabModel<'_> {
         }
     }
 
-    fn bind_token(
+    /// The slot of one reference-shaped leaf.
+    pub(crate) fn bind_leaf(
         &self,
-        node: &Node,
+        leaf: &Node,
         host_sheet: u32,
         host_row: i32,
         host_column: i32,
         plan: &mut MintPlan,
-    ) -> Result<StableToken, BindError> {
-        Ok(match node {
-            Node::BooleanKind(value) => StableToken::Boolean(*value),
-            Node::NumberKind(value) => StableToken::Number(*value),
-            Node::StringKind(value) => StableToken::String(value.clone()),
+    ) -> Result<StableRef, BindError> {
+        Ok(match leaf {
             Node::ReferenceKind {
                 sheet_name,
                 sheet_index,
@@ -314,17 +391,10 @@ impl CollabModel<'_> {
                 column,
             } => {
                 let (sheet, at) = self.bind_sheet(sheet_name, *sheet_index, host_sheet)?;
-                StableToken::CellRef {
+                StableRef::Cell {
                     sheet,
                     row: self.bind_axis(at, true, *absolute_row, *row, host_row, plan)?,
-                    column: self.bind_axis(
-                        at,
-                        false,
-                        *absolute_column,
-                        *column,
-                        host_column,
-                        plan,
-                    )?,
+                    col: self.bind_axis(at, false, *absolute_column, *column, host_column, plan)?,
                 }
             }
             Node::RangeKind {
@@ -340,102 +410,42 @@ impl CollabModel<'_> {
                 column2,
             } => {
                 let (sheet, at) = self.bind_sheet(sheet_name, *sheet_index, host_sheet)?;
-                StableToken::RangeRef {
+                // `A:A` and `5:7` span the whole grid on one axis: open ends, not the last row's key.
+                let (row1, row2) =
+                    if *absolute_row1 && *absolute_row2 && *row1 == 1 && *row2 == LAST_ROW {
+                        (OPEN_AXIS, OPEN_AXIS)
+                    } else {
+                        (
+                            self.bind_axis(at, true, *absolute_row1, *row1, host_row, plan)?,
+                            self.bind_axis(at, true, *absolute_row2, *row2, host_row, plan)?,
+                        )
+                    };
+                let (col1, col2) = if *absolute_column1
+                    && *absolute_column2
+                    && *column1 == 1
+                    && *column2 == LAST_COLUMN
+                {
+                    (OPEN_AXIS, OPEN_AXIS)
+                } else {
+                    (
+                        self.bind_axis(at, false, *absolute_column1, *column1, host_column, plan)?,
+                        self.bind_axis(at, false, *absolute_column2, *column2, host_column, plan)?,
+                    )
+                };
+                StableRef::Range {
                     sheet,
-                    row1: self.bind_axis(at, true, *absolute_row1, *row1, host_row, plan)?,
-                    column1: self.bind_axis(
-                        at,
-                        false,
-                        *absolute_column1,
-                        *column1,
-                        host_column,
-                        plan,
-                    )?,
-                    row2: self.bind_axis(at, true, *absolute_row2, *row2, host_row, plan)?,
-                    column2: self.bind_axis(
-                        at,
-                        false,
-                        *absolute_column2,
-                        *column2,
-                        host_column,
-                        plan,
-                    )?,
+                    row1,
+                    col1,
+                    row2,
+                    col2,
                 }
             }
-            // No sheet to key against, so these carry the parser's own fields: they print back as
-            // typed and evaluate to #REF!, as ordinal does.
-            Node::WrongReferenceKind {
-                sheet_name,
-                absolute_row,
-                absolute_column,
-                row,
-                column,
-            } => StableToken::WrongRef {
-                sheet_name: sheet_name.clone(),
-                absolute_row: *absolute_row,
-                absolute_column: *absolute_column,
-                row: *row,
-                column: *column,
-            },
-            Node::WrongRangeKind {
-                sheet_name,
-                absolute_row1,
-                absolute_column1,
-                row1,
-                column1,
-                absolute_row2,
-                absolute_column2,
-                row2,
-                column2,
-            } => StableToken::WrongRange {
-                sheet_name: sheet_name.clone(),
-                absolute_row1: *absolute_row1,
-                absolute_column1: *absolute_column1,
-                row1: *row1,
-                column1: *column1,
-                absolute_row2: *absolute_row2,
-                absolute_column2: *absolute_column2,
-                row2: *row2,
-                column2: *column2,
-            },
-            Node::OpRangeKind { .. } => StableToken::OpRange,
-            Node::OpConcatenateKind { .. } => StableToken::OpConcatenate,
-            Node::OpPowerKind { .. } => StableToken::OpPower,
-            Node::OpSumKind { kind, .. } => StableToken::OpSum(kind.clone()),
-            Node::OpProductKind { kind, .. } => StableToken::OpProduct(kind.clone()),
-            Node::CompareKind { kind, .. } => StableToken::Compare(kind.clone()),
-            Node::UnaryKind { kind, .. } => StableToken::Unary(kind.clone()),
-            Node::ImplicitIntersection { automatic, .. } => StableToken::ImplicitIntersection {
-                automatic: *automatic,
-            },
-            Node::SpillRangeOperator { .. } => StableToken::SpillRange,
-            Node::FunctionKind { kind, args } => StableToken::Function {
-                kind: kind.clone(),
-                argc: args.len() as u16,
-            },
-            // The parser's `id` is a resolution artifact of the last evaluation, never authored.
-            Node::NamedFunctionKind { name, args, .. } => StableToken::NamedFunction {
-                name: name.clone(),
-                argc: args.len() as u16,
-            },
-            Node::NamedVariableKind { name, .. } => StableToken::NamedVariable(name.clone()),
-            Node::LambdaDefKind { parameters, .. } => StableToken::LambdaDef {
-                parameters: parameters
-                    .iter()
-                    .map(|p| LambdaParam {
-                        name: p.name.clone(),
-                        optional: p.is_optional,
-                    })
-                    .collect(),
-            },
-            Node::LambdaCallKind { args, .. } => StableToken::LambdaCall {
-                argc: args.len() as u16,
-            },
-            Node::ArrayKind(rows) => StableToken::Array(
-                rows.iter()
-                    .map(|row| row.iter().map(ArrayValue::from).collect())
-                    .collect(),
-            ),
+            // No sheet to key against: the leaf keeps the parser's own fields in the text, and
+            // lowering retries the name.
+            Node::WrongReferenceKind { sheet_name, .. }
+            | Node::WrongRangeKind { sheet_name, .. } => {
+                StableRef::Unresolved(sheet_name.clone().unwrap_or_default())
+            }
             Node::DefinedNameKind((name, scope, _)) => {
                 let scope = match scope {
                     Some(at) => Some(
@@ -447,133 +457,95 @@ impl CollabModel<'_> {
                 let id = self
                     .defined_name_id_of(scope, name)
                     .ok_or_else(|| BindError::UnresolvedDefinedName(name.clone()))?;
-                StableToken::DefinedName(id)
+                StableRef::Name(id)
             }
-            Node::TableNameKind(name) => StableToken::TableName(name.clone()),
-            Node::ErrorKind(kind) => StableToken::Error(kind.clone()),
-            Node::EmptyArgKind => StableToken::EmptyArg,
-            // Handled by the walk, which stops at the first one.
-            Node::ParseErrorKind { formula, .. } => StableToken::RawText(formula.clone()),
+            Node::NamedVariableKind { name, .. } => StableRef::Unresolved(name.clone()),
+            // `leaves` hands nothing else over.
+            _ => return Err(BindError::UnboundReference),
         })
     }
 
-    /// Rebuilds the ordinal AST for a formula, anchored as `host` says.
+    pub(crate) fn lower(&self, text: &str, refs: &[StableRef], host: &Host) -> Node {
+        let sheet = self
+            .workbook
+            .worksheets
+            .get(host.sheet as usize)
+            .map(|ws| ws.get_name())
+            .unwrap_or_default();
+        let mut node = parse_shape(text, &sheet, host.row, host.column);
+        self.overwrite_leaves(&mut node, refs, host);
+        node
+    }
+
+    /// Overwrites every reference-shaped leaf of `node` from `refs`, resolved against the index,
+    /// returning whether the node changed. A slot count that differs from the leaf count is
+    /// corruption: the whole node becomes `#REF!`.
     ///
     /// References whose sheet or key no longer resolves come back as the `Wrong*` nodes upstream
-    /// evaluates to `#REF!`: displacement happens here, not by rewriting stored formulas.
-    pub fn lower(&self, formula: &StableFormula, host: &Host) -> Result<Node, LowerError> {
-        StableFormula::validate(formula.tokens()).map_err(LowerError::Invalid)?;
-        if self.indexes(host.sheet).is_none() {
-            return Err(LowerError::UnknownHostSheet(host.sheet));
-        }
-        let mut stack: Vec<Node> = Vec::new();
-        // Built at most once per call, and only if a `DefinedName` token asks for it.
-        let names = OnceCell::new();
-        for token in formula.tokens() {
-            let node = self.lower_token(token, &mut stack, host, &names)?;
-            stack.push(node);
-        }
-        // The validator guarantees exactly one value is left.
-        stack.pop().ok_or(LowerError::Corrupt)
-    }
-
-    /// Pops `n` operands, oldest first.
-    fn pop_args(stack: &mut Vec<Node>, n: u16) -> Result<Vec<Node>, LowerError> {
-        let at = stack
-            .len()
-            .checked_sub(n as usize)
-            .ok_or(LowerError::Corrupt)?;
-        Ok(stack.split_off(at))
-    }
-
-    fn pop_one(stack: &mut Vec<Node>) -> Result<Box<Node>, LowerError> {
-        stack.pop().map(Box::new).ok_or(LowerError::Corrupt)
-    }
-
-    /// The sheet a reference names: how it renders, and where it sits — `None` once it is deleted,
-    /// which leaves its keys with no index to resolve against.
-    fn lower_sheet(
+    /// evaluates to `#REF!`: displacement happens here, not by rewriting stored slots.
+    pub(crate) fn overwrite_leaves(
         &self,
-        sheet: &StableSheetRef,
-        host_sheet: u32,
-    ) -> (Option<String>, Option<u32>) {
-        let StableSheetRef::Sheet(id) = sheet else {
-            return (None, Some(host_sheet));
-        };
-        match self.position_of_sheet(*id) {
-            Some(at) => (
-                Some(self.workbook.worksheets[at as usize].name.clone()),
-                Some(at),
-            ),
-            // The name register outlives the sheet, so a revived id renders as it did before.
-            None => (
-                self.workbook
-                    .meta
-                    .sheet_names
-                    .get(id)
-                    .map(|name| name.value.clone()),
-                None,
-            ),
-        }
-    }
-
-    /// An axis' `(absolute, value)` pair — an ordinal when absolute, else an offset from the host.
-    /// `None` once the key is gone from the index.
-    fn lower_axis(
-        &self,
-        at: u32,
-        is_row: bool,
-        axis: &StableAxisRef,
+        node: &mut Node,
+        refs: &[StableRef],
         host: &Host,
-    ) -> Option<(bool, i32)> {
-        let index = self.indexes(at)?;
-        let ordinal = if is_row {
-            Stable::row_ordinal(index, &axis.key)?
-        } else {
-            Stable::col_ordinal(index, &axis.key)?
-        };
-        Some(match axis.absolute || host.absolute {
-            true => (true, ordinal),
-            false => (false, ordinal - if is_row { host.row } else { host.column }),
-        })
+    ) -> bool {
+        // Built at most once per call, and only if a name slot asks for it.
+        let names = DisplayNameCache::new();
+        let mut targets = leaves_mut(node);
+        if targets.len() == refs.len() {
+            let mut changed = false;
+            for (leaf, slot) in targets.iter_mut().zip(refs) {
+                let lowered = self.lower_leaf(slot, leaf, host, &names);
+                if **leaf != lowered {
+                    **leaf = lowered;
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+        let corrupt = Node::ErrorKind(token::Error::REF);
+        if *node == corrupt {
+            return false;
+        }
+        *node = corrupt;
+        true
     }
 
-    fn lower_token(
+    fn lower_leaf(
         &self,
-        token: &StableToken,
-        stack: &mut Vec<Node>,
+        slot: &StableRef,
+        leaf: &Node,
         host: &Host,
         names: &DisplayNameCache,
-    ) -> Result<Node, LowerError> {
-        Ok(match token {
-            StableToken::Boolean(value) => Node::BooleanKind(*value),
-            StableToken::Number(value) => Node::NumberKind(*value),
-            StableToken::String(value) => Node::StringKind(value.clone()),
-            StableToken::CellRef { sheet, row, column } => {
-                let (name, at) = self.lower_sheet(sheet, host.sheet);
-                let (r, c) = match at {
-                    Some(at) => (
-                        self.lower_axis(at, true, row, host),
-                        self.lower_axis(at, false, column, host),
+    ) -> Node {
+        match slot {
+            StableRef::Cell { sheet, row, col } => {
+                let (sheet_name, at) = self.lower_sheet(sheet, host.sheet);
+                let (r, c) = match at.and_then(|at| self.indexes(at)) {
+                    Some(index) => (
+                        lower_axis(&index.rows, row, host.row),
+                        lower_axis(&index.cols, col, host.column),
                     ),
                     None => (None, None),
                 };
                 match (at, r, c) {
-                    (Some(at), Some((absolute_row, row)), Some((absolute_column, column))) => {
-                        Node::ReferenceKind {
-                            sheet_name: name,
-                            sheet_index: at,
-                            absolute_row,
-                            absolute_column,
-                            row,
-                            column,
-                        }
-                    }
+                    (
+                        Some(sheet_index),
+                        Some((absolute_row, row)),
+                        Some((absolute_column, column)),
+                    ) => Node::ReferenceKind {
+                        sheet_name,
+                        sheet_index,
+                        absolute_row,
+                        absolute_column,
+                        row,
+                        column,
+                    },
                     (_, r, c) => {
                         let (absolute_row, row) = r.unwrap_or(DEAD_AXIS);
                         let (absolute_column, column) = c.unwrap_or(DEAD_AXIS);
                         Node::WrongReferenceKind {
-                            sheet_name: name,
+                            sheet_name,
                             absolute_row,
                             absolute_column,
                             row,
@@ -582,32 +554,33 @@ impl CollabModel<'_> {
                     }
                 }
             }
-            StableToken::RangeRef {
+            StableRef::Range {
                 sheet,
                 row1,
-                column1,
+                col1,
                 row2,
-                column2,
+                col2,
             } => {
-                let (name, at) = self.lower_sheet(sheet, host.sheet);
-                let (r1, c1, r2, c2) = match at {
-                    Some(at) => (
-                        self.lower_axis(at, true, row1, host),
-                        self.lower_axis(at, false, column1, host),
-                        self.lower_axis(at, true, row2, host),
-                        self.lower_axis(at, false, column2, host),
-                    ),
-                    None => (None, None, None, None),
+                let (sheet_name, at) = self.lower_sheet(sheet, host.sheet);
+                let [r1, r2, c1, c2] = match at.and_then(|at| self.indexes(at)) {
+                    Some(index) => {
+                        let [r1, r2] = lower_span(&index.rows, LAST_ROW, row1, row2, host.row);
+                        let [c1, c2] =
+                            lower_span(&index.cols, LAST_COLUMN, col1, col2, host.column);
+                        [r1, r2, c1, c2]
+                    }
+                    None => [None; 4],
                 };
                 let (absolute_row1, row1) = r1.unwrap_or(DEAD_AXIS);
                 let (absolute_column1, column1) = c1.unwrap_or(DEAD_AXIS);
                 let (absolute_row2, row2) = r2.unwrap_or(DEAD_AXIS);
                 let (absolute_column2, column2) = c2.unwrap_or(DEAD_AXIS);
-                // One dead corner poisons the whole rectangle.
-                if let (Some(at), true) = (at, [r1, c1, r2, c2].iter().all(Option::is_some)) {
-                    Node::RangeKind {
-                        sheet_name: name,
-                        sheet_index: at,
+                // One dead corner poisons the whole rectangle, as the ordinal model's displacement
+                // does.
+                match (at, [r1, c1, r2, c2].iter().all(Option::is_some)) {
+                    (Some(sheet_index), true) => Node::RangeKind {
+                        sheet_name,
+                        sheet_index,
                         absolute_row1,
                         absolute_column1,
                         row1,
@@ -616,10 +589,9 @@ impl CollabModel<'_> {
                         absolute_column2,
                         row2,
                         column2,
-                    }
-                } else {
-                    Node::WrongRangeKind {
-                        sheet_name: name,
+                    },
+                    _ => Node::WrongRangeKind {
+                        sheet_name,
                         absolute_row1,
                         absolute_column1,
                         row1,
@@ -628,12 +600,34 @@ impl CollabModel<'_> {
                         absolute_column2,
                         row2,
                         column2,
-                    }
+                    },
                 }
             }
-            // Resolved here too: a sheet by that name showing up later makes it a live reference,
-            // the way the ordinal model's reparse does.
-            StableToken::WrongRef {
+            StableRef::Name(id) => self.lower_defined_name(*id, names),
+            StableRef::Unresolved(name) => self.retry_unbound(name, leaf, host, names),
+        }
+    }
+
+    /// An unbound leaf keeps what the text says and resolves its name anew: a sheet by that name
+    /// showing up later makes it a live reference, and a defined name a live name, the way the
+    /// ordinal model's reparse does. One that goes again falls back.
+    fn retry_unbound(
+        &self,
+        name: &str,
+        leaf: &Node,
+        host: &Host,
+        names: &DisplayNameCache,
+    ) -> Node {
+        match leaf {
+            Node::ReferenceKind {
+                sheet_name,
+                absolute_row,
+                absolute_column,
+                row,
+                column,
+                ..
+            }
+            | Node::WrongReferenceKind {
                 sheet_name,
                 absolute_row,
                 absolute_column,
@@ -659,7 +653,19 @@ impl CollabModel<'_> {
                     column: *column,
                 },
             },
-            StableToken::WrongRange {
+            Node::RangeKind {
+                sheet_name,
+                absolute_row1,
+                absolute_column1,
+                row1,
+                column1,
+                absolute_row2,
+                absolute_column2,
+                row2,
+                column2,
+                ..
+            }
+            | Node::WrongRangeKind {
                 sheet_name,
                 absolute_row1,
                 absolute_column1,
@@ -697,113 +703,41 @@ impl CollabModel<'_> {
                     column2: *column2,
                 },
             },
-            StableToken::DefinedName(id) => self.lower_defined_name(*id, names),
-            StableToken::TableName(name) => Node::TableNameKind(name.clone()),
-            StableToken::NamedVariable(name) => match self.named_variable_id(name, host, names) {
+            _ => match self.named_variable_id(name, host, names) {
                 Some(id) => self.lower_defined_name(id, names),
                 None => Node::NamedVariableKind {
-                    name: name.clone(),
+                    name: name.to_string(),
                     id: None,
                 },
             },
-            StableToken::Error(kind) => Node::ErrorKind(kind.clone()),
-            StableToken::EmptyArg => Node::EmptyArgKind,
-            StableToken::Array(rows) => Node::ArrayKind(
-                rows.iter()
-                    .map(|row| row.iter().map(ArrayNode::from).collect())
-                    .collect(),
+        }
+    }
+
+    /// The sheet a reference names: how it renders, and where it sits — `None` once it is deleted,
+    /// which leaves its keys with no index to resolve against.
+    fn lower_sheet(
+        &self,
+        sheet: &StableSheetRef,
+        host_sheet: u32,
+    ) -> (Option<String>, Option<u32>) {
+        let StableSheetRef::Sheet(id) = sheet else {
+            return (None, Some(host_sheet));
+        };
+        match self.position_of_sheet(*id) {
+            Some(at) => (
+                Some(self.workbook.worksheets[at as usize].name.clone()),
+                Some(at),
             ),
-            // Verbatim text is what upstream holds for a formula it cannot parse.
-            StableToken::RawText(text) => Node::ParseErrorKind {
-                formula: text.clone(),
-                message: "Unparseable formula".to_string(),
-                position: 0,
-                expecting: Vec::new(),
-            },
-            StableToken::Unary(kind) => Node::UnaryKind {
-                kind: kind.clone(),
-                right: Self::pop_one(stack)?,
-            },
-            StableToken::ImplicitIntersection { automatic } => Node::ImplicitIntersection {
-                automatic: *automatic,
-                child: Self::pop_one(stack)?,
-            },
-            StableToken::SpillRange => Node::SpillRangeOperator {
-                child: Self::pop_one(stack)?,
-            },
-            StableToken::OpRange => {
-                let right = Self::pop_one(stack)?;
-                Node::OpRangeKind {
-                    left: Self::pop_one(stack)?,
-                    right,
-                }
-            }
-            StableToken::OpConcatenate => {
-                let right = Self::pop_one(stack)?;
-                Node::OpConcatenateKind {
-                    left: Self::pop_one(stack)?,
-                    right,
-                }
-            }
-            StableToken::OpPower => {
-                let right = Self::pop_one(stack)?;
-                Node::OpPowerKind {
-                    left: Self::pop_one(stack)?,
-                    right,
-                }
-            }
-            StableToken::OpSum(kind) => {
-                let right = Self::pop_one(stack)?;
-                Node::OpSumKind {
-                    kind: kind.clone(),
-                    left: Self::pop_one(stack)?,
-                    right,
-                }
-            }
-            StableToken::OpProduct(kind) => {
-                let right = Self::pop_one(stack)?;
-                Node::OpProductKind {
-                    kind: kind.clone(),
-                    left: Self::pop_one(stack)?,
-                    right,
-                }
-            }
-            StableToken::Compare(kind) => {
-                let right = Self::pop_one(stack)?;
-                Node::CompareKind {
-                    kind: kind.clone(),
-                    left: Self::pop_one(stack)?,
-                    right,
-                }
-            }
-            StableToken::Function { kind, argc } => Node::FunctionKind {
-                kind: kind.clone(),
-                args: Self::pop_args(stack, *argc)?,
-            },
-            StableToken::NamedFunction { name, argc } => Node::NamedFunctionKind {
-                id: None,
-                name: name.clone(),
-                args: Self::pop_args(stack, *argc)?,
-            },
-            StableToken::LambdaDef { parameters } => Node::LambdaDefKind {
-                parameters: parameters
-                    .iter()
-                    .map(|p| NamedVariable {
-                        name: p.name.clone(),
-                        id: None,
-                        is_optional: p.optional,
-                    })
-                    .collect(),
-                body: Self::pop_one(stack)?,
-            },
-            StableToken::LambdaCall { argc } => {
-                let args = Self::pop_args(stack, *argc)?;
-                Node::LambdaCallKind {
-                    lambda: Self::pop_one(stack)?,
-                    args,
-                }
-            }
-        })
+            // The name register outlives the sheet, so a revived id renders as it did before.
+            None => (
+                self.workbook
+                    .meta
+                    .sheet_names
+                    .get(id)
+                    .map(|name| name.value.clone()),
+                None,
+            ),
+        }
     }
 
     /// The defined name a bare name in a formula stands for, looked up as the parser looks one up:
@@ -855,7 +789,7 @@ impl CollabModel<'_> {
             None => None,
         };
         // The body text is the projection `normalize_defined_names` already lowered, so lowering a
-        // name never re-lowers another name's stream.
+        // name never re-lowers another name's body.
         match self
             .workbook
             .defined_names
@@ -872,9 +806,10 @@ impl CollabModel<'_> {
 mod test {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+    use crate::collab::log::Commit;
     use crate::collab::patch::invert_patches;
-    use crate::expressions::parser::stringify::to_rc_format;
     use crate::expressions::token::OpUnary;
+    use crate::model::Model;
     use crate::types::Cell;
     use std::collections::HashSet;
 
@@ -890,24 +825,19 @@ mod test {
         model
     }
 
-    /// The parsed AST the model holds for the formula in a cell.
-    fn node_at(model: &CollabModel<'_>, sheet: u32, row: i32, column: i32) -> Node {
+    /// The entry the formula cell at `(row, column)` points at.
+    fn entry_at(model: &CollabModel<'_>, sheet: u32, row: i32, column: i32) -> usize {
         let ws = &model.workbook.worksheets[sheet as usize];
-        let r = Stable::row_at(&ws.index, row).unwrap();
-        let c = Stable::col_at(&ws.index, column).unwrap();
-        match ws.sheet_data.cell(&r, &c).unwrap() {
-            Cell::CellFormula { f, .. } | Cell::ArrayFormula { f, .. } => {
-                (*model.parsed_formulas[sheet as usize][*f as usize].0).clone()
-            }
+        match &*ws.sheet_data.cell(row, column).unwrap() {
+            Cell::CellFormula { f, .. } | Cell::ArrayFormula { f, .. } => *f as usize,
             other => panic!("not a formula cell: {other:?}"),
         }
     }
 
-    /// A token's variant name, for coverage bookkeeping.
-    fn kind_of(token: &StableToken) -> String {
-        let name = format!("{token:?}");
-        let end = name.find(['(', ' ']).unwrap_or(name.len());
-        name[..end].to_string()
+    /// The parsed AST the model holds for the formula in a cell.
+    fn node_at(model: &CollabModel<'_>, sheet: u32, row: i32, column: i32) -> Node {
+        let f = entry_at(model, sheet, row, column);
+        (*model.parsed_formulas[sheet as usize][f].0).clone()
     }
 
     /// Binds against a model whose grid is already materialized, so nothing needs minting.
@@ -926,13 +856,32 @@ mod test {
         let bound = bind(model, node, sheet, row, column).unwrap();
         let decoded: StableFormula = bitcode::decode(&bitcode::encode(&bound)).unwrap();
         assert_eq!(decoded, bound);
-        model
-            .lower(&decoded, &Host::relative(sheet, row, column))
-            .unwrap()
+        model.lower(
+            &decoded.text,
+            &decoded.refs,
+            &Host::relative(sheet, row, column),
+        )
     }
 
-    /// Every token kind that a formula text can produce survives bind → bytes → lower unchanged,
-    /// from any host cell.
+    /// A slot's variant name, for coverage bookkeeping.
+    fn kind_of(slot: &StableRef) -> String {
+        let name = format!("{slot:?}");
+        let end = name.find(['(', ' ']).unwrap_or(name.len());
+        name[..end].to_string()
+    }
+
+    /// The commits of the last local edits, undone.
+    fn undo(model: &mut CollabModel<'_>, commits: &[Commit]) {
+        let undo: Vec<_> = commits
+            .iter()
+            .rev()
+            .flat_map(|commit| invert_patches(&commit.patches))
+            .collect();
+        model.commit_local(undo);
+    }
+
+    /// Every formula a text can produce survives bind → bytes → lower unchanged, from any host
+    /// cell, and every slot kind is produced.
     #[test]
     fn bind_lower_round_trip() {
         let mut model = model(30, 15);
@@ -952,6 +901,7 @@ mod test {
             "=Sheet1!C3",
             "=SUM(Sheet2!A1:B3)",
             "=SUM(A$1:$B2)",
+            "=SUM(A:A)+SUM(2:3)",
             "=IF(A1>0,\"y\",-A1%)",
             "=IF(A1<>1,A1,)",
             "=#VALUE!",
@@ -963,6 +913,7 @@ mod test {
             "=myLambda(1,A1)",
             "=MyName*2",
             "=notAName",
+            "=Nope!A1+SUM(Nope!A1:B2)",
             "=SUM(A1:A5)*MyName",
         ];
         for (host_row, host_column) in [(1, 1), (5, 3), (12, 7)] {
@@ -972,48 +923,24 @@ mod test {
                     .unwrap();
                 let node = node_at(&model, 0, host_row, host_column);
                 let bound = bind(&model, &node, 0, host_row, host_column).unwrap();
-                seen.extend(bound.tokens().iter().map(kind_of));
+                seen.extend(bound.refs.iter().map(kind_of));
                 let lowered = round_trip(&model, &node, 0, host_row, host_column);
+                assert_eq!(lowered, node, "{text} at ({host_row}, {host_column})");
+                // The stored text is the R1C1 rendering of the stored node.
+                let f = entry_at(&model, 0, host_row, host_column);
                 assert_eq!(
-                    to_rc_format(&lowered),
-                    to_rc_format(&node),
-                    "{text} at ({host_row}, {host_column})"
+                    model.workbook.worksheets[0].shared_formulas[f],
+                    to_rc_format(&node)
                 );
             }
         }
-
-        // The battery is only worth what it covers. `OpRange` and `TableName` have no formula text
-        // this model can produce (no tables, and the range operator needs a dynamic left operand).
-        for kind in [
-            "Boolean",
-            "Number",
-            "String",
-            "CellRef",
-            "RangeRef",
-            "DefinedName",
-            "NamedVariable",
-            "Error",
-            "EmptyArg",
-            "Array",
-            "Unary",
-            "ImplicitIntersection",
-            "SpillRange",
-            "OpConcatenate",
-            "OpPower",
-            "OpSum",
-            "OpProduct",
-            "Compare",
-            "Function",
-            "NamedFunction",
-            "LambdaDef",
-            "LambdaCall",
-        ] {
-            assert!(seen.contains(kind), "no formula produced a {kind} token");
+        for kind in ["Cell", "Range", "Name", "Unresolved"] {
+            assert!(seen.contains(kind), "no formula produced a {kind} slot");
         }
     }
 
     /// A bound reference names rows and columns, not positions: structural edits move what it
-    /// renders as with no rewrite, and deleting its target turns it into a `#REF!` node.
+    /// lowers to with no rewrite of its slots, and deleting its target turns it into a `#REF!` node.
     #[test]
     fn references_follow_structural_ops() {
         let mut model = model(30, 15);
@@ -1038,10 +965,11 @@ mod test {
         };
         let bound = bind(&model, &node, 0, 10, 2).unwrap();
 
-        let refs = |model: &CollabModel<'_>, host_row: i32| match model
-            .lower(&bound, &Host::relative(0, host_row, 2))
-            .unwrap()
-        {
+        let refs = |model: &CollabModel<'_>, host_row: i32| match model.lower(
+            &bound.text,
+            &bound.refs,
+            &Host::relative(0, host_row, 2),
+        ) {
             Node::OpSumKind { left, right, .. } => (*left, *right),
             other => panic!("not a sum: {other:?}"),
         };
@@ -1099,14 +1027,14 @@ mod test {
         };
         let bound = bind(&model, &cross, 0, 1, 1).unwrap();
         assert_eq!(
-            model.lower(&bound, &Host::relative(0, 1, 1)).unwrap(),
+            model.lower(&bound.text, &bound.refs, &Host::relative(0, 1, 1)),
             cross
         );
 
         model.flush();
         model.delete_sheet(1).unwrap();
         assert_eq!(
-            model.lower(&bound, &Host::relative(0, 1, 1)).unwrap(),
+            model.lower(&bound.text, &bound.refs, &Host::relative(0, 1, 1)),
             Node::WrongReferenceKind {
                 sheet_name: Some("Sheet2".to_string()),
                 absolute_row: true,
@@ -1116,15 +1044,10 @@ mod test {
             }
         );
 
-        let undo: Vec<_> = model
-            .flush()
-            .iter()
-            .rev()
-            .flat_map(|commit| invert_patches(&commit.patches))
-            .collect();
-        model.commit_local(undo);
+        let commits = model.flush();
+        undo(&mut model, &commits);
         assert_eq!(
-            model.lower(&bound, &Host::relative(0, 1, 1)).unwrap(),
+            model.lower(&bound.text, &bound.refs, &Host::relative(0, 1, 1)),
             cross
         );
     }
@@ -1173,7 +1096,7 @@ mod test {
             assert_eq!(bind(&model, &node, 0, 1, 1).unwrap_err(), expected);
         }
 
-        // Unparseable text is the whole stream, and comes back exactly as it went in.
+        // Unparseable text is the whole formula, with nothing to key, and comes back as it went in.
         let raw = Node::ParseErrorKind {
             formula: "=this is not a formula".to_string(),
             message: "boom".to_string(),
@@ -1182,8 +1105,11 @@ mod test {
         };
         let bound = bind(&model, &raw, 0, 1, 1).unwrap();
         assert_eq!(
-            bound.tokens(),
-            [StableToken::RawText("=this is not a formula".to_string())]
+            bound,
+            StableFormula {
+                text: "=this is not a formula".to_string(),
+                refs: Vec::new(),
+            }
         );
         assert_eq!(
             to_rc_format(&round_trip(&model, &raw, 0, 1, 1)),
@@ -1196,49 +1122,274 @@ mod test {
         let bound = bind(&model, &name, 0, 1, 1).unwrap();
         model.delete_defined_name("MyName", None).unwrap();
         assert_eq!(
-            model.lower(&bound, &Host::relative(0, 1, 1)).unwrap(),
+            model.lower(&bound.text, &bound.refs, &Host::relative(0, 1, 1)),
             Node::NamedVariableKind {
                 name: "MyName".to_string(),
                 id: None,
             }
         );
         // An id no register ever held has not even a name left.
-        let unknown = StableFormula::new(vec![StableToken::DefinedName(7)]).unwrap();
+        let unknown = StableFormula {
+            text: "MyName".to_string(),
+            refs: vec![StableRef::Name(7)],
+        };
         assert_eq!(
-            model.lower(&unknown, &Host::relative(0, 1, 1)).unwrap(),
+            model.lower(&unknown.text, &unknown.refs, &Host::relative(0, 1, 1)),
             Node::ErrorKind(token::Error::NAME)
+        );
+        // A slot count that differs from the leaf count is corruption.
+        let corrupt = StableFormula {
+            text: "R1C1+R2C2".to_string(),
+            refs: vec![StableRef::Name(7)],
+        };
+        assert_eq!(
+            model.lower(&corrupt.text, &corrupt.refs, &Host::relative(0, 1, 1)),
+            Node::ErrorKind(token::Error::REF)
         );
     }
 
-    /// Depth the recursive-descent parser could never produce from text: both walks are iterative,
-    /// so it is only bounded by `MAX_TOKENS`.
+    /// Depth the recursive-descent parser could never produce from text: the walks that bind and
+    /// re-lower a node are iterative, so depth is no limit for them.
     #[test]
     fn deep_formula_no_overflow() {
         let model = model(5, 5);
         let depth = 8_000;
-        let mut node = Node::NumberKind(1.0);
+        let mut node = Node::ReferenceKind {
+            sheet_name: None,
+            sheet_index: 0,
+            absolute_row: true,
+            absolute_column: true,
+            row: 2,
+            column: 3,
+        };
         for _ in 0..depth {
             node = Node::UnaryKind {
                 kind: OpUnary::Minus,
                 right: Box::new(node),
             };
         }
-        let bound = bind(&model, &node, 0, 1, 1).unwrap();
-        assert_eq!(bound.tokens().len(), depth + 1);
-        let lowered = model.lower(&bound, &Host::relative(0, 1, 1)).unwrap();
+        let refs = leaves(&node)
+            .into_iter()
+            .map(|leaf| model.bind_leaf(leaf, 0, 1, 1, &mut MintPlan::default()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(refs.len(), 1);
+        // Lowered against the index as it is, the leaf is what it was.
+        assert!(!model.overwrite_leaves(&mut node, &refs, &Host::relative(0, 1, 1)));
         // Comparing or dropping the tree recurses, so it is walked and dismantled iteratively.
-        let mut cursor = &lowered;
+        let mut cursor = &node;
         let mut seen = 0;
         while let Node::UnaryKind { right, .. } = cursor {
             cursor = right;
             seen += 1;
         }
-        assert_eq!((seen, cursor), (depth, &Node::NumberKind(1.0)));
-        for tree in [node, lowered] {
-            let mut tree = tree;
-            while let Node::UnaryKind { right, .. } = tree {
-                tree = *right;
-            }
+        assert_eq!(seen, depth);
+        assert!(matches!(cursor, Node::ReferenceKind { row: 2, .. }));
+        let mut tree = node;
+        while let Node::UnaryKind { right, .. } = tree {
+            tree = *right;
         }
+    }
+
+    #[test]
+    fn stable_ordinal_parity() {
+        let mut o = Model::new_empty("model", "en", "UTC", "en").unwrap();
+        let mut c = CollabModel::new(1);
+        c.new_sheet();
+        for model_sheet in [o.new_sheet().1, c.new_sheet().1] {
+            assert_eq!(model_sheet, 1);
+        }
+        for row in 1..=6 {
+            let value = format!("{row}");
+            o.set_user_input(0, row, 1, value.clone()).unwrap();
+            c.set_user_input(0, row, 1, value).unwrap();
+        }
+        for (row, column, value) in [(2, 2, "10"), (1, 3, "0.5")] {
+            o.set_user_input(1, row, column, value.to_string()).unwrap();
+            c.set_user_input(1, row, column, value.to_string()).unwrap();
+        }
+        o.new_defined_name("tax", None, "Sheet2!$C$1").unwrap();
+        c.new_defined_name("tax", None, "Sheet2!$C$1").unwrap();
+        let formula = "=SUM(A1:A4)+Sheet2!$B$2*tax";
+        o.set_user_input(0, 5, 4, formula.to_string()).unwrap();
+        c.set_user_input(0, 5, 4, formula.to_string()).unwrap();
+        let same = |o: &mut Model, c: &mut CollabModel, row: i32, step: &str| {
+            o.evaluate();
+            c.evaluate();
+            assert_eq!(
+                c.get_cell_formula(0, row, 4),
+                o.get_cell_formula(0, row, 4),
+                "{step}"
+            );
+            assert_eq!(
+                c.get_formatted_cell_value(0, row, 4),
+                o.get_formatted_cell_value(0, row, 4),
+                "{step}"
+            );
+        };
+        same(&mut o, &mut c, 5, "seed");
+
+        let (sheet1, sheet2) = (
+            c.workbook.worksheets[0].sheet_id,
+            c.workbook.worksheets[1].sheet_id,
+        );
+        let tax = c.defined_name_id_of(None, "tax").unwrap();
+        let f = entry_at(&c, 0, 5, 4);
+        let text = |c: &CollabModel<'_>| c.workbook.worksheets[0].shared_formulas[f].clone();
+        assert_eq!(text(&c), "SUM(R[-4]C[-3]:R[-1]C[-3])+Sheet2!R2C2*tax");
+        let index = &c.workbook.worksheets[0].index;
+        let refs = &index.formulas[f].refs;
+        assert!(matches!(
+            refs.as_slice(),
+            [
+                StableRef::Range {
+                    sheet: StableSheetRef::Current,
+                    ..
+                },
+                StableRef::Cell {
+                    sheet: StableSheetRef::Sheet(id),
+                    row: StableAxisRef { absolute: true, .. },
+                    col: StableAxisRef { absolute: true, .. },
+                },
+                StableRef::Name(name),
+            ] if *id == sheet2 && *name == tax
+        ));
+        let users = HashSet::from([f as u32]);
+        assert_eq!(index.referenced_by.get(&sheet1), Some(&users));
+        assert_eq!(index.referenced_by.get(&sheet2), Some(&users));
+        assert_eq!(index.names_referenced_by.get(&tax), Some(&users));
+
+        // Two rows before row 3: the host is now D7, and A1:A4 rows 1..6.
+        o.insert_rows(0, 3, 2).unwrap();
+        c.insert_rows(0, 3, 2).unwrap();
+        same(&mut o, &mut c, 7, "insert rows");
+        assert_eq!(text(&c), "SUM(R[-6]C[-3]:R[-1]C[-3])+Sheet2!R2C2*tax");
+        assert_eq!(
+            c.get_cell_formula(0, 7, 4),
+            Ok(Some("=SUM(A1:A6)+Sheet2!$B$2*tax".to_string()))
+        );
+
+        o.rename_sheet_by_index(1, "Data").unwrap();
+        c.rename_sheet_by_index(1, "Data").unwrap();
+        same(&mut o, &mut c, 7, "rename sheet");
+        assert_eq!(text(&c), "SUM(R[-6]C[-3]:R[-1]C[-3])+Data!R2C2*tax");
+
+        // The low corner's row goes: as in the ordinal model, the corner shows `#REF!`. (What the
+        // broken range evaluates to differs, see `broken_range_endpoint_value`.)
+        c.flush();
+        o.delete_rows(0, 1, 1).unwrap();
+        c.delete_rows(0, 1, 1).unwrap();
+        o.evaluate();
+        c.evaluate();
+        assert_eq!(c.get_cell_formula(0, 6, 4), o.get_cell_formula(0, 6, 4));
+        assert_eq!(
+            c.get_cell_formula(0, 6, 4),
+            Ok(Some("=SUM(#REF!:A5)+Data!$B$2*tax".to_string()))
+        );
+
+        // The slot kept the key, so the undo brings the range back whole.
+        let commits = c.flush();
+        undo(&mut c, &commits);
+        c.evaluate();
+        assert_eq!(
+            c.get_cell_formula(0, 7, 4),
+            Ok(Some("=SUM(A1:A6)+Data!$B$2*tax".to_string()))
+        );
+        // 1 + 2 + 3 + 4 over the six rows, plus 10 * 0.5.
+        assert_eq!(c.get_formatted_cell_value(0, 7, 4), Ok("15".to_string()));
+    }
+
+    fn shape(leaf: &Node) -> &'static str {
+        match leaf {
+            Node::ReferenceKind { .. } | Node::WrongReferenceKind { .. } => "reference",
+            Node::RangeKind { .. } | Node::WrongRangeKind { .. } => "range",
+            _ => "name",
+        }
+    }
+
+    /// The same text lowers to the same leaves on a replica that names its sheets and defined names
+    /// differently, and to the same node once both replicas hold the same workbook.
+    #[test]
+    fn shape_is_stable_across_replicas() {
+        let mut a = model(10, 5);
+        a.new_defined_name("tax", None, "0.5").unwrap(); // A: tax=0.5
+        let mut b = CollabModel::new(2);
+        b.apply_batch(&a.flush()).unwrap();
+        // `b` renames a sheet and defines names `a` would read differently.
+        b.rename_sheet_by_index(1, "Other").unwrap();
+        b.new_defined_name("a", None, "1").unwrap(); // B: a=1
+        b.new_defined_name("Nope", None, "2").unwrap(); // B: Nope=2
+        let formulas = [
+            "=LAMBDA(a,b,a*b)(2,3)",
+            "=Sheet2!A1+SUM(Sheet2!A1:B3)",
+            "=tax*2",
+            "=Nope!A1+Nope",
+            "=SUM(A:A)+LET(x,1,x+A1)",
+        ];
+        let mut bound = Vec::new();
+        for (row, text) in formulas.iter().enumerate() {
+            let row = row as i32 + 1;
+            a.set_user_input(0, row, 3, text.to_string()).unwrap();
+            let node = node_at(&a, 0, row, 3);
+            let formula = bind(&a, &node, 0, row, 3).unwrap();
+            let on_b = b.lower(&formula.text, &formula.refs, &Host::relative(0, row, 3));
+            assert_eq!(
+                leaves(&on_b).into_iter().map(shape).collect::<Vec<_>>(),
+                leaves(&node).into_iter().map(shape).collect::<Vec<_>>(),
+                "{text}"
+            );
+            bound.push((row, formula));
+        }
+        // Once both hold the same workbook, the same slots lower to the same node.
+        let (from_a, from_b) = (a.flush(), b.flush());
+        a.apply_batch(&from_b).unwrap();
+        b.apply_batch(&from_a).unwrap();
+        for (row, formula) in bound {
+            assert_eq!(
+                a.lower(&formula.text, &formula.refs, &Host::relative(0, row, 3)),
+                b.lower(&formula.text, &formula.refs, &Host::relative(0, row, 3)),
+            );
+            assert_eq!(node_at(&a, 0, row, 3), node_at(&b, 0, row, 3));
+        }
+        // ...and what the user sees agrees too: the same text, evaluating to the same value.
+        a.evaluate();
+        b.evaluate();
+        for (row, text) in formulas.iter().enumerate() {
+            let row = row as i32 + 1;
+            let shown = a.get_cell_formula(0, row, 3).unwrap();
+            assert!(shown.is_some(), "{text} shows no formula");
+            assert_eq!(b.get_cell_formula(0, row, 3).unwrap(), shown, "{text}");
+            assert_eq!(
+                a.get_formatted_cell_value(0, row, 3),
+                b.get_formatted_cell_value(0, row, 3),
+                "{text}"
+            );
+        }
+    }
+
+    /// A single-cell reference to a deleted row is `#REF!`, as in the ordinal model, and the undo
+    /// of the delete brings it back.
+    #[test]
+    fn deleted_row_reference_comes_back_on_undo() {
+        let mut o = Model::new_empty("model", "en", "UTC", "en").unwrap();
+        let mut c = CollabModel::new(1);
+        c.new_sheet();
+        for (row, column, value) in [(3, 1, "5"), (1, 3, "=A3")] {
+            o.set_user_input(0, row, column, value.to_string()).unwrap();
+            c.set_user_input(0, row, column, value.to_string()).unwrap();
+        }
+        c.flush();
+        o.delete_rows(0, 3, 1).unwrap();
+        c.delete_rows(0, 3, 1).unwrap();
+        o.evaluate();
+        c.evaluate();
+        assert_eq!(c.get_cell_formula(0, 1, 3), o.get_cell_formula(0, 1, 3));
+        assert_eq!(c.get_formatted_cell_value(0, 1, 3), Ok("#REF!".to_string()));
+
+        let commits = c.flush();
+        undo(&mut c, &commits);
+        c.evaluate();
+        assert_eq!(c.get_cell_formula(0, 1, 3), Ok(Some("=A3".to_string())));
+        assert_eq!(c.get_formatted_cell_value(0, 1, 3), Ok("5".to_string()));
     }
 }

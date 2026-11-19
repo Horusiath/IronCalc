@@ -305,6 +305,38 @@ impl Row {
         }
     }
 
+    /// Moves the cell in each column `c` to column `f(c)`, or drops it when
+    /// that is `None`. `f` must not send two columns to the same one.
+    pub(super) fn remap_columns(&mut self, f: impl Fn(i32) -> Option<i32>) {
+        match self {
+            Row::Numbers {
+                first_column,
+                values,
+                ..
+            } => {
+                // A run that lands whole and in order stays a run
+                let new_first = f(*first_column);
+                let whole = (0..values.len() as i64).all(|offset| {
+                    let column = (*first_column as i64 + offset) as i32;
+                    f(column).map(i64::from) == new_first.map(|first| first as i64 + offset)
+                });
+                if let (true, Some(new_first)) = (whole, new_first) {
+                    *first_column = new_first;
+                    return;
+                }
+                let mut cells = self.to_cells();
+                cells.retain_mut(|(column, _)| remap(column, &f));
+                // A move takes one cell out of order; a sorted row sorts in one pass.
+                cells.sort_by_key(|(column, _)| *column);
+                *self = Row::from_cells(cells);
+            }
+            Row::Cells(cells) => {
+                cells.retain_mut(|(column, _)| remap(column, &f));
+                cells.sort_by_key(|(column, _)| *column);
+            }
+        }
+    }
+
     pub(super) fn remove(&mut self, column: i32) -> Option<Cell> {
         if let Row::Numbers {
             first_column,
@@ -324,6 +356,17 @@ impl Row {
         let cells = self.cells_mut();
         let index = position(cells, column).ok()?;
         Some(cells.remove(index).1)
+    }
+}
+
+/// Gives the column its new place; false when it has none.
+fn remap(column: &mut i32, f: impl Fn(i32) -> Option<i32>) -> bool {
+    match f(*column) {
+        Some(new_column) => {
+            *column = new_column;
+            true
+        }
+        None => false,
     }
 }
 

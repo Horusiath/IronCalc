@@ -1,30 +1,21 @@
-use std::borrow::Cow;
-
 use crate::collab::bind::Host;
-use crate::collab::cell_map::CellMap;
-use crate::collab::formula::StableFormula;
+use crate::collab::formula::{FormulaRefs, StableFormula};
 use crate::collab::fractional_index::{FractionalIndex, FractionalKey, SESSION_SUFFIX_LEN};
 use crate::collab::log::{Commit, Lww, SessionId, Timestamp};
 use crate::collab::patch::{
     CfPropKind, DefinedNameBody, DefinedNameId, NamedStyle, NamedStyleId, Patch, PropKind, SheetId,
     SheetPropKind, WorkbookPropKind,
 };
-use crate::collab::spill::Spills;
-use crate::constants::{
-    COLUMN_WIDTH_FACTOR, DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT, ROW_HEIGHT_FACTOR,
-};
-use crate::expressions::parser::{Node, Parser};
-use crate::expressions::utils::{is_valid_column_number, is_valid_row};
+use crate::constants::{COLUMN_WIDTH_FACTOR, DEFAULT_COLUMN_WIDTH};
+use crate::expressions::parser::Parser;
 use crate::language::get_default_language;
 use crate::locale::get_default_locale;
 use crate::model::Model;
 use crate::new_empty::{APPLICATION, APP_VERSION, IRONCALC_USER};
 use crate::types::{
-    sealed::Sealed, Cell, CellAddr, Col, Metadata, Position, RangeRef, Row, Style, Workbook,
-    WorkbookSettings, Worksheet,
+    sealed::Sealed, Cell, Metadata, Position, RangeRef, Row, Workbook, WorkbookSettings, Worksheet,
 };
 use crate::tz::Tz;
-use crate::worksheet::WorksheetDimension;
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -34,7 +25,7 @@ const DEFAULT_LOCALE: &str = "en";
 const DEFAULT_TIMEZONE: &str = "UTC";
 
 /// Stable addressing: rows and columns are named by the [`FractionalKey`] they were minted with, and
-/// where they currently sit lives in the sheet's [`SheetIndexes`] rather than in the name.
+/// where they currently sit lives in the sheet's [`StableIndexes`] rather than in the name.
 ///
 /// The derives mirror [`Ordinal`](crate::types::Ordinal)'s: they are what the `#[derive]`s on the
 /// generic containers, which emit `A: Trait` bounds, ask of the marker.
@@ -45,279 +36,87 @@ pub struct Stable;
 
 impl Sealed for Stable {}
 
-impl Position for Stable {
-    type Key = FractionalKey;
-    type SheetIndex = SheetIndexes;
-    type SheetData = CellMap;
-    type MergedCell = StableRange;
-    type WorkbookMeta = WorkbookMeta;
-    type Local = CollabSession;
-    type UserState = StableUserState;
-    type Formula = StableFormula;
-    type Link = StableLink;
-
-    const CSE_SPILLS: bool = true;
-
-    fn row_ordinal(idx: &SheetIndexes, key: &FractionalKey) -> Option<i32> {
+impl Stable {
+    pub(crate) fn row_ordinal(idx: &StableIndexes, key: &FractionalKey) -> Option<i32> {
         idx.rows.position_of(key).map(|p| p as i32 + 1)
     }
 
-    fn col_ordinal(idx: &SheetIndexes, key: &FractionalKey) -> Option<i32> {
+    pub(crate) fn col_ordinal(idx: &StableIndexes, key: &FractionalKey) -> Option<i32> {
         idx.cols.position_of(key).map(|p| p as i32 + 1)
     }
 
-    fn row_at(idx: &SheetIndexes, ordinal: i32) -> Option<FractionalKey> {
+    pub(crate) fn row_at(idx: &StableIndexes, ordinal: i32) -> Option<FractionalKey> {
         if ordinal < 1 {
             return None;
         }
         idx.rows.key(ordinal as usize - 1).cloned()
     }
 
-    fn col_at(idx: &SheetIndexes, ordinal: i32) -> Option<FractionalKey> {
+    pub(crate) fn col_at(idx: &StableIndexes, ordinal: i32) -> Option<FractionalKey> {
         if ordinal < 1 {
             return None;
         }
         idx.cols.key(ordinal as usize - 1).cloned()
     }
+}
 
-    fn row_count(idx: &SheetIndexes) -> i32 {
-        idx.rows.len() as i32
+impl Stable {
+    /// Takes the spill cell at `(row, column)` out of the slot, putting back the styled empty cell
+    /// it covered, if any.
+    pub(crate) fn uncover(sheet: &mut Worksheet<Stable>, row: i32, column: i32) {
+        match sheet.index.covered.remove(&(row, column)) {
+            Some(s) => {
+                sheet
+                    .sheet_data
+                    .set_cell(row, column, Cell::EmptyCell { s });
+            }
+            None => {
+                sheet.sheet_data.remove_cell(row, column);
+            }
+        }
     }
+}
 
-    fn col_count(idx: &SheetIndexes) -> i32 {
-        idx.cols.len() as i32
-    }
+impl Position for Stable {
+    type SheetIndex = StableIndexes;
+    type WorkbookMeta = WorkbookMeta;
+    type Local = CollabSession;
+    type UserState = StableUserState;
 
-    fn resolve_merged(merged: &StableRange, idx: &SheetIndexes) -> Option<(i32, i32, i32, i32)> {
-        // A merge clamped down to one cell is no merge, as under ordinal addressing.
-        Self::resolve_range(merged, idx).filter(|(r1, c1, r2, c2)| (r1, c1) != (r2, c2))
-    }
+    const CSE_SPILLS: bool = true;
 
-    fn resolve_range(range: &StableRange, idx: &SheetIndexes) -> Option<(i32, i32, i32, i32)> {
-        range.resolve(idx)
-    }
-
-    fn to_ordinal_range(range: &StableRange, idx: &SheetIndexes) -> Option<RangeRef> {
-        // Through `resolve`, so a deleted corner clamps exactly as it does for evaluation.
-        let (row1, column1, row2, column2) = range.resolve(idx)?;
-        Some(RangeRef {
-            rows: range.rows.as_ref().map(|_| (row1, row2)),
-            cols: range.cols.as_ref().map(|_| (column1, column2)),
-        })
-    }
-
-    fn stored_cell(sheet: &Worksheet<Stable>, row: i32, column: i32) -> Option<Cow<'_, Cell>> {
-        let r = Self::row_at(&sheet.index, row)?;
-        let c = Self::col_at(&sheet.index, column)?;
-        sheet.sheet_data.cell(&r, &c).map(Cow::Borrowed)
-    }
-
-    fn stored_cell_mut(sheet: &mut Worksheet<Stable>, row: i32, column: i32) -> Option<&mut Cell> {
-        let r = Self::row_at(&sheet.index, row)?;
-        let c = Self::col_at(&sheet.index, column)?;
-        sheet.sheet_data.cell_mut(&r, &c)
-    }
-
-    fn store_cell(
+    fn spill_written(
         sheet: &mut Worksheet<Stable>,
         row: i32,
         column: i32,
-        cell: Cell,
-    ) -> Result<(), String> {
-        let (Some(r), Some(c)) = (
-            Self::row_at(&sheet.index, row),
-            Self::col_at(&sheet.index, column),
-        ) else {
-            return Err("Incorrect row or column".to_string());
-        };
-        sheet.sheet_data.insert_cell(r, c, cell);
-        Ok(())
-    }
-
-    /// A key the index no longer addresses names no position, and is skipped.
-    fn stored_cells(sheet: &Worksheet<Stable>) -> impl Iterator<Item = (i32, i32, Cow<'_, Cell>)> {
-        let index = &sheet.index;
-        index.rows.view().enumerate().flat_map(move |(i, row_key)| {
-            let mut cells: Vec<(i32, &Cell)> = sheet
-                .sheet_data
-                .row_cells(row_key)
-                .filter_map(|(column_key, cell)| {
-                    Some((Self::col_ordinal(index, column_key)?, cell))
-                })
-                .collect();
-            cells.sort_unstable_by_key(|(column, _)| *column);
-            let row = i as i32 + 1;
-            cells
-                .into_iter()
-                .map(move |(column, cell)| (row, column, Cow::Borrowed(cell)))
-        })
-    }
-
-    /// A key the index no longer addresses names no position, and is skipped.
-    fn stored_columns_in_row(sheet: &Worksheet<Stable>, row: i32) -> Vec<i32> {
-        let Some(row_key) = Self::row_at(&sheet.index, row) else {
-            return Vec::new();
-        };
-        let mut columns: Vec<i32> = sheet
-            .sheet_data
-            .row_cells(&row_key)
-            .filter_map(|(key, _)| Self::col_ordinal(&sheet.index, key))
-            .collect();
-        columns.sort_unstable();
-        columns
-    }
-
-    /// The stored cells of the stretch, with the overlay spills filling the positions that hold
-    /// nothing or an empty cell, as [`Position::cell`] reads them one by one.
-    fn cells_in_row_between(
-        sheet: &Worksheet<Stable>,
-        row: i32,
-        first_column: i32,
-        last_column: i32,
-    ) -> impl Iterator<Item = (i32, Cow<'_, Cell>)> {
-        let index = &sheet.index;
-        let mut cells: Vec<(i32, Cow<'_, Cell>)> = Vec::new();
-        if let Some(row_key) = Self::row_at(index, row) {
-            let stored = sheet.sheet_data.row_cells(&row_key);
-            let (first, last) = (
-                first_column.max(1),
-                last_column.min(index.cols.len() as i32),
-            );
-            if i64::from(last) - i64::from(first) + 1 < stored.len() as i64 {
-                // Fewer columns than cells: look each column up.
-                for column in first..=last {
-                    let cell = index
-                        .cols
-                        .key(column as usize - 1)
-                        .and_then(|col_key| sheet.sheet_data.cell(&row_key, col_key));
-                    cells.extend(cell.map(|cell| (column, Cow::Borrowed(cell))));
-                }
-            } else {
-                cells.extend(stored.filter_map(|(col_key, cell)| {
-                    let column = Self::col_ordinal(index, col_key)?;
-                    (first..=last)
-                        .contains(&column)
-                        .then_some((column, Cow::Borrowed(cell)))
-                }));
-                cells.sort_unstable_by_key(|(column, _)| *column);
+        replaced: Option<&Cell>,
+    ) {
+        sheet.index.spilled.0 = true;
+        if let Some(Cell::EmptyCell { s }) = replaced {
+            if *s != 0 {
+                sheet.index.covered.insert((row, column), *s);
             }
         }
-        let mut spills = index
-            .spills
-            .in_row_between(row, first_column, last_column)
-            .peekable();
-        if spills.peek().is_none() {
-            return cells.into_iter();
-        }
-        let mut stored = cells.into_iter().peekable();
-        let mut merged = Vec::with_capacity(stored.len());
-        for (column, spill) in spills {
-            while let Some(cell) = stored.next_if(|(c, _)| *c < column) {
-                merged.push(cell);
-            }
-            match stored.next_if(|(c, _)| *c == column) {
-                Some(cell) if !matches!(*cell.1, Cell::EmptyCell { .. }) => merged.push(cell),
-                _ => merged.push((column, Cow::Borrowed(spill))),
-            }
-        }
-        merged.extend(stored);
-        merged.into_iter()
-    }
-
-    fn column_width(sheet: &Worksheet<Stable>, column: i32) -> Result<f64, String> {
-        if !is_valid_column_number(column) {
-            return Err(format!("Column number '{column}' is not valid."));
-        }
-        if Self::is_column_hidden(sheet, column)? {
-            return Ok(0.0);
-        }
-        Ok(match sheet.covering_col(column, PropKind::Width) {
-            Some(col) => col.width * COLUMN_WIDTH_FACTOR,
-            None => DEFAULT_COLUMN_WIDTH,
-        })
-    }
-
-    fn is_column_hidden(sheet: &Worksheet<Stable>, column: i32) -> Result<bool, String> {
-        if !is_valid_column_number(column) {
-            return Err(format!("Column number '{column}' is not valid."));
-        }
-        Ok(sheet
-            .covering_col(column, PropKind::Hidden)
-            .is_some_and(|col| col.hidden))
-    }
-
-    fn row_height(sheet: &Worksheet<Stable>, row: i32) -> Result<f64, String> {
-        if !is_valid_row(row) {
-            return Err(format!("Row number '{row}' is not valid."));
-        }
-        Ok(match sheet.row_record(row) {
-            Some(record) if record.hidden => 0.0,
-            Some(record) => record.height * ROW_HEIGHT_FACTOR,
-            None => DEFAULT_ROW_HEIGHT,
-        })
-    }
-
-    fn is_row_hidden(sheet: &Worksheet<Stable>, row: i32) -> Result<bool, String> {
-        if !is_valid_row(row) {
-            return Err(format!("Row number '{row}' is not valid."));
-        }
-        Ok(sheet.row_record(row).is_some_and(|record| record.hidden))
-    }
-
-    fn dimension(sheet: &Worksheet<Stable>) -> WorksheetDimension {
-        let dimension = sheet
-            .sheet_data
-            .dimension(&sheet.index)
-            .unwrap_or(WorksheetDimension::new(1, 1, 1, 1));
-        debug_assert_eq!(dimension, crate::worksheet::scan_dimension(sheet));
-        dimension
-    }
-
-    fn cell(sheet: &Worksheet<Stable>, row: i32, column: i32) -> Option<Cow<'_, Cell>> {
-        let stored = sheet.stored_cell(row, column);
-        if matches!(stored.as_deref(), Some(Cell::EmptyCell { .. }) | None) {
-            // we need to check spills in case if spilled cell reached beyond
-            // materialized fractional index
-            if let Some(spill) = sheet.index.spills.get(row, column) {
-                return Some(Cow::Borrowed(spill));
-            }
-        }
-        stored
-    }
-
-    fn write_spill(
-        sheet: &mut Worksheet<Stable>,
-        row: i32,
-        column: i32,
-        cell: Cell,
-    ) -> Result<(), String> {
-        sheet.index.spills.insert(row, column, cell)
     }
 
     fn drop_spills(sheet: &mut Worksheet<Stable>) {
-        sheet.index.spills.clear();
+        if !sheet.index.spilled.0 {
+            return;
+        }
+        let spills: Vec<(i32, i32)> = (sheet.sheet_data.cells())
+            .filter(|(_, _, cell)| matches!(**cell, Cell::SpillCell { .. }))
+            .map(|(row, column, _)| (row, column))
+            .collect();
+        for (row, column) in spills {
+            Stable::uncover(sheet, row, column);
+        }
+        sheet.index.covered.clear();
+        sheet.index.spilled.0 = false;
     }
 
-    /// The cell's own stream, lowered against the cell: relative references come back as offsets
-    /// from it and keep the `$`-less spelling they were authored with. `parsed_formulas` cannot
-    /// serve this — it holds the all-absolute form the evaluator shares between hosts.
-    fn materialize_formula<'b>(
-        model: &'b CollabModel<'_>,
-        sheet: u32,
-        row: i32,
-        column: i32,
-        index: i32,
-    ) -> Option<std::borrow::Cow<'b, Node>> {
-        let formula = model
-            .workbook
-            .worksheets
-            .get(sheet as usize)?
-            .shared_formulas
-            .get(index as usize)?;
-        model
-            .lower(formula, &Host::relative(sheet, row, column))
-            .ok()
-            .map(std::borrow::Cow::Owned)
+    fn clear_spill(sheet: &mut Worksheet<Stable>, row: i32, column: i32) -> Result<(), String> {
+        Stable::uncover(sheet, row, column);
+        Ok(())
     }
 }
 
@@ -334,6 +133,48 @@ pub enum StableLink {
     },
 }
 
+/// A [`Comment`](crate::types::Comment) without its cell: what a comment patch carries, and what
+/// [`StableIndexes::comments`] holds by key.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct CommentBody {
+    pub text: String,
+    pub author_name: String,
+    pub author_id: Option<String>,
+}
+
+/// The state a column span holds: what [`StableIndexes::col_spans`] keeps per span, and what the
+/// ordinal `cols` records are derived from.
+///
+/// A span under stable addressing is a *region*, not a fixed set of columns: it covers whatever
+/// currently sits between its two corner keys, exactly as [`StableRange`]'s column axis does (see
+/// [`resolve_axis`]). Consequences:
+///
+/// - A column moved out of the region loses the span's properties, and one moved in gains them.
+///   That is not Excel's behaviour, but Excel has no concurrent semantics to be faithful to.
+/// - A single-column span `(k, k)` follows its column wherever it moves.
+/// - A [`FractionalKey::NULL`] corner is an open end, so `(NULL, NULL)` is the storable whole-axis
+///   span — the register `set_style` over the whole sheet writes to.
+/// - Only concurrency can produce overlapping spans; those resolve per position and per property
+///   by register write timestamp — LWW, newest covering span wins — when `cols` is derived.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct ColSpan {
+    pub width: f64,
+    pub custom_width: bool,
+    pub hidden: bool,
+    pub style: Option<i32>,
+}
+
+impl Default for ColSpan {
+    fn default() -> Self {
+        ColSpan {
+            width: DEFAULT_COLUMN_WIDTH / COLUMN_WIDTH_FACTOR,
+            custom_width: false,
+            hidden: false,
+            style: None,
+        }
+    }
+}
+
 /// Undo/redo for a collaborative [`UserModel`](crate::UserModel): stacks of the patches a local
 /// action emitted. Declared here, but not consumed until a later round wires undo/redo up.
 #[derive(Default)]
@@ -342,16 +183,111 @@ pub struct StableUserState {
     pub redo_stack: Vec<Vec<Patch>>,
 }
 
-/// The two orderings a sheet's keys resolve against, plus the sheet's write registers.
 #[derive(Clone, Debug, Default, PartialEq, Encode, Decode)]
-pub struct SheetIndexes {
+pub struct StableIndexes {
     pub rows: FractionalIndex,
     pub cols: FractionalIndex,
     pub registers: SheetRegisters,
     pub parents: HashMap<StableCellAddress, NamedStyleId>,
-    /// Spill cells are rebuild from sheet state.
+    /// Deleted rows that still hold a property. We may need to revive them via undo or InsertRows.
+    pub hidden_rows: HashMap<FractionalKey, Row>,
+    /// Index for cell's own style, if that cell was spilled over.
+    pub covered: HashMap<(i32, i32), i32>,
+    /// Every merged range, including those that currently resolve to nothing, sorted and
+    /// deduplicated. The worksheet's `merged_cells` holds the ones that resolve.
+    pub merges: Vec<StableRange>,
+    /// The state every column span was written to; the worksheet's `cols` is derived from it.
+    pub col_spans: HashMap<(FractionalKey, FractionalKey), ColSpan>,
+    /// Comments by cell; the worksheet's `comments` holds the ones whose cell is visible.
+    pub comments: HashMap<StableCellAddress, CommentBody>,
+    /// Links by cell; the worksheet's `links` holds the ones whose cell is visible.
+    pub links: HashMap<StableCellAddress, StableLink>,
+    /// Each conditional formatting rule's ranges, by rule key; the rule's ordinal ranges are
+    /// derived from them.
+    pub cf_ranges: HashMap<FractionalKey, Vec<StableRange>>,
+    /// Whether the sheet may hold a spill cell, so that dropping them can skip the scan.
     #[bitcode(skip)]
-    pub spills: Spills,
+    pub spilled: Hint<bool>,
+    /// Whether a reorder this commit moved something the sheet's formulas may reference: set when
+    /// the index's [`Reorder`](super::fractional_index::Reorder)s are followed, swept into
+    /// [`Dirty::sheets`] at the end of the commit.
+    #[bitcode(skip)]
+    pub reordered: Hint<bool>,
+    /// `formulas[f]` describes `shared_formulas[f]`: the cell its text is relative to, and its
+    /// slots.
+    pub formulas: Vec<FormulaRefs>,
+    /// The entries of this sheet holding a slot on a given sheet, the host's own included. Derived
+    /// from `formulas`: not encoded, rebuilt on decode.
+    #[bitcode(skip)]
+    pub referenced_by: HashMap<SheetId, HashSet<u32>>,
+    /// The entries of this sheet holding a slot on a given defined name. Derived, as above.
+    #[bitcode(skip)]
+    pub names_referenced_by: HashMap<DefinedNameId, HashSet<u32>>,
+    /// The entries of this sheet holding an unbound slot. Derived, as above.
+    #[bitcode(skip)]
+    pub unbound: HashSet<u32>,
+}
+
+impl StableIndexes {
+    pub(crate) fn new(suffix: [u8; 4]) -> Self {
+        StableIndexes {
+            rows: FractionalIndex::new(vec![], vec![], suffix),
+            cols: FractionalIndex::new(vec![], vec![], suffix),
+            ..Default::default()
+        }
+    }
+
+    /// Register entry `f` in the reverse sets; `host` is the id of the sheet it lives on.
+    pub(crate) fn register_formula(&mut self, f: u32, host: SheetId) {
+        let Some(entry) = self.formulas.get(f as usize) else {
+            return;
+        };
+        for sheet in entry.sheets(host) {
+            self.referenced_by.entry(sheet).or_default().insert(f);
+        }
+        for name in entry.names() {
+            self.names_referenced_by.entry(name).or_default().insert(f);
+        }
+        if entry.unresolved() {
+            self.unbound.insert(f);
+        }
+    }
+
+    /// Takes entry `f` out of the reverse sets, dropping the sets it leaves empty so that equal
+    /// `formulas` give equal sets.
+    pub(crate) fn unregister_formula(&mut self, f: u32, host: SheetId) {
+        let Some(entry) = self.formulas.get(f as usize) else {
+            return;
+        };
+        for sheet in entry.sheets(host) {
+            if let Some(set) = self.referenced_by.get_mut(&sheet) {
+                set.remove(&f);
+                if set.is_empty() {
+                    self.referenced_by.remove(&sheet);
+                }
+            }
+        }
+        for name in entry.names() {
+            if let Some(set) = self.names_referenced_by.get_mut(&name) {
+                set.remove(&f);
+                if set.is_empty() {
+                    self.names_referenced_by.remove(&name);
+                }
+            }
+        }
+        self.unbound.remove(&f);
+    }
+}
+
+/// Local bookkeeping kept inside [StableIndexes] next to the document state: it never takes part
+/// in equality, and it is never encoded.
+#[derive(Clone, Debug, Default)]
+pub struct Hint<T>(pub T);
+
+impl<T> PartialEq for Hint<T> {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 /// The last-write guard of every register a sheet owns: only the [`Timestamp`] that last won each,
@@ -422,12 +358,16 @@ pub struct NamedStyleState {
 
 /// A description of a continuous range of cells, described using stable identifiers, which can be
 /// used to keep track of cell position under various concurrent operations (ex. adding/removing
-/// rows or columns).
-pub type StableRange = RangeRef<Stable>;
+/// rows or columns). A `None` axis is the whole axis.
+#[derive(Encode, Decode, Debug, PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
+pub struct StableRange {
+    pub rows: Option<(FractionalKey, FractionalKey)>,
+    pub cols: Option<(FractionalKey, FractionalKey)>,
+}
 
 /// A cell position, described using stable identifiers, which can be used to keep track of cell
 /// position under various concurrent operations (ex. adding/removing rows or columns).
-pub type StableCellAddress = CellAddr<Stable>;
+pub type StableCellAddress = (FractionalKey, FractionalKey);
 
 /// Where one axis of a [`StableRange`] currently sits, as a 1-based closed interval.
 ///
@@ -435,7 +375,7 @@ pub type StableCellAddress = CellAddr<Stable>;
 /// index — clamps to where it would now sit: the `lo` corner takes the element that took its place,
 /// the `hi` corner the one just before it. A [`FractionalKey::NULL`] corner is not a position at
 /// all but an open end. `None` means clamping collapsed the span.
-fn resolve_axis(
+pub(crate) fn resolve_axis(
     index: &FractionalIndex,
     span: &Option<(FractionalKey, FractionalKey)>,
 ) -> Option<(i32, i32)> {
@@ -472,13 +412,26 @@ fn resolve_axis(
 impl StableRange {
     /// The 1-based ordinal rectangle `(row1, column1, row2, column2)` this currently denotes, or
     /// `None` if it collapsed. An unbounded axis spans whatever the index holds right now.
-    pub fn resolve(&self, idx: &SheetIndexes) -> Option<(i32, i32, i32, i32)> {
+    pub fn resolve(&self, idx: &StableIndexes) -> Option<(i32, i32, i32, i32)> {
         let (row1, row2) = resolve_axis(&idx.rows, &self.rows)?;
         let (column1, column2) = resolve_axis(&idx.cols, &self.cols)?;
         Some((row1, column1, row2, column2))
     }
 
-    pub fn contains(&self, idx: &SheetIndexes, row: &FractionalKey, col: &FractionalKey) -> bool {
+    pub(crate) fn merged_rect(&self, idx: &StableIndexes) -> Option<(i32, i32, i32, i32)> {
+        self.resolve(idx)
+            .filter(|(r1, c1, r2, c2)| (r1, c1) != (r2, c2))
+    }
+
+    pub fn to_ordinal(&self, idx: &StableIndexes) -> Option<RangeRef> {
+        let (row1, column1, row2, column2) = self.resolve(idx)?;
+        Some(RangeRef {
+            rows: self.rows.as_ref().map(|_| (row1, row2)),
+            cols: self.cols.as_ref().map(|_| (column1, column2)),
+        })
+    }
+
+    pub fn contains(&self, idx: &StableIndexes, row: &FractionalKey, col: &FractionalKey) -> bool {
         let Some((row1, column1, row2, column2)) = self.resolve(idx) else {
             return false;
         };
@@ -489,100 +442,71 @@ impl StableRange {
     }
 }
 
-/// A column-property span under stable addressing is a *region*, not a fixed set of columns: it
-/// covers whatever currently sits between its two corner keys, exactly as [`StableRange`]'s column
-/// axis does. Consequences:
-///
-/// - A column moved out of the region loses the span's properties, and one moved in gains them.
-///   That is not Excel's behaviour, but Excel has no concurrent semantics to be faithful to.
-/// - A single-column span `(k, k)` follows its column wherever it moves.
-/// - A [`FractionalKey::NULL`] corner is an open end, so `(NULL, NULL)` is the storable whole-axis
-///   span — the register `set_style` over the whole sheet writes to.
-/// - Sequential (local) edits shatter wide spans eagerly, exactly as the ordinal code does today:
-///   the wide record is removed and narrower ones written in the same commit.
-/// - Only concurrency can produce overlapping spans; those resolve per position by register write
-///   timestamp — LWW, newest covering span wins. That machinery is phase-5 work.
-impl Col<Stable> {
-    /// The 1-based ordinal interval this span currently covers, or `None` if it collapsed.
-    /// Same corner resolution and clamping as [`StableRange`]: see [`resolve_axis`].
-    pub fn resolve(&self, idx: &SheetIndexes) -> Option<(i32, i32)> {
-        resolve_axis(&idx.cols, &Some((self.min.clone(), self.max.clone())))
-    }
-}
-
 impl Worksheet<Stable> {
-    /// The column record that owns property `kind` at ordinal `column`: of the spans covering it,
-    /// the one whose register was written last. Only concurrency makes them overlap; a record with
-    /// no register entry for `kind` never wrote it and does not compete.
-    pub(crate) fn covering_col(&self, column: i32, kind: PropKind) -> Option<&Col<Stable>> {
-        let mut best: Option<(&Timestamp, &Col<Stable>)> = None;
-        for col in &self.cols {
-            match col.resolve(&self.index) {
-                Some((min, max)) if (min..=max).contains(&column) => {}
-                _ => continue,
-            }
-            let span = (col.min.clone(), col.max.clone());
-            let Some(ts) = self.index.registers.col_spans.get(&(span, kind)) else {
-                continue;
-            };
-            if best.is_none_or(|(stored, _)| stored < ts) {
-                best = Some((ts, col));
-            }
-        }
-        best.map(|(_, col)| col)
+    pub(crate) fn row_by_index(&self, ordinal: i32) -> Option<&Row> {
+        let at = self.rows.binary_search_by_key(&ordinal, |r| r.r).ok()?;
+        self.rows.get(at)
     }
 
-    pub(crate) fn covering_col_style(&self, column: i32) -> Option<&Col<Stable>> {
-        let mut best: Option<(Timestamp, &Col<Stable>)> = None;
-        // since column styles are using col spans we need to iterate over all
-        // spans and check if given column belongs to them
-        for col in &self.cols {
-            match col.resolve(&self.index) {
-                Some((min, max)) if (min..=max).contains(&column) => {}
-                _ => continue,
-            }
-            let span = (col.min.clone(), col.max.clone());
-            let Some(ts) = PropKind::STYLE
-                .into_iter()
-                .filter_map(|kind| self.index.registers.col_spans.get(&(span.clone(), kind)))
-                .max()
-            else {
-                continue;
-            };
-            if best.is_none_or(|(stored, _)| stored < *ts) {
-                best = Some((*ts, col));
-            }
+    pub(crate) fn row_by_key(&self, key: &FractionalKey) -> Option<&Row> {
+        match self.index.rows.position_of(key) {
+            Some(p) => self.row_by_index(p as i32 + 1),
+            None => self.index.hidden_rows.get(key),
         }
-        best.map(|(_, col)| col)
     }
 
-    pub fn get_column_style(&self, column: i32) -> Result<Option<i32>, String> {
-        if !is_valid_column_number(column) {
-            return Err(format!("Column number '{column}' is not valid."));
-        }
-        Ok(self.covering_col_style(column).and_then(|col| col.style))
+    /// The ordinal `(row, column)` cell `at` sits at, `None` when its row or column is not visible.
+    pub(crate) fn ordinal(&self, at: &StableCellAddress) -> Option<(i32, i32)> {
+        Some((
+            Stable::row_ordinal(&self.index, &at.0)?,
+            Stable::col_ordinal(&self.index, &at.1)?,
+        ))
     }
 
-    /// Rows are addressed one key at a time, so there is nothing to resolve between.
-    fn row_record(&self, row: i32) -> Option<&Row<Stable>> {
-        let key = Stable::row_at(&self.index, row)?;
-        self.rows.iter().find(|r| r.r == key)
+    /// The style patches wrote at `(row, column)`, `None` for no cell. A spill's own style comes
+    /// from the row or column at evaluation time, which replicas see at different moments: what a
+    /// spill answers is the authored style it covers.
+    pub(crate) fn authored_style(&self, (row, column): (i32, i32)) -> Option<i32> {
+        match &*self.sheet_data.cell(row, column)? {
+            Cell::SpillCell { .. } => self.index.covered.get(&(row, column)).copied(),
+            cell => Some(cell.get_style()),
+        }
+    }
+    /// Where the host of a formula entry sits: its ordinal, or, while its row or column is hidden,
+    /// where it would sit. Any fixed choice keeps the entry a function of the index.
+    pub(crate) fn host_of(&self, sheet_id: usize, at: &StableCellAddress) -> Host {
+        let place = |index: &FractionalIndex, key: &FractionalKey| {
+            index
+                .position_of(key)
+                .unwrap_or_else(|| index.active_index(key)) as i32
+                + 1
+        };
+        Host::relative(
+            sheet_id as u32,
+            place(&self.index.rows, &at.0),
+            place(&self.index.cols, &at.1),
+        )
+    }
+
+    /// The record a row property is written to: at its ordinal in `rows` while the row is visible
+    /// (created there if absent), in `hidden_rows` while it is not.
+    pub fn row_mut(&mut self, identity: &FractionalKey) -> &mut Row {
+        let Some(p) = self.index.rows.position_of(identity) else {
+            let hidden = &mut self.index.hidden_rows;
+            return hidden
+                .entry(identity.clone())
+                .or_insert_with(|| Row::new(0));
+        };
+        let r = p as i32 + 1;
+        match self.rows.binary_search_by_key(&r, |row| row.r) {
+            Ok(at) => &mut self.rows[at],
+            Err(at) => self.rows.insert_mut(at, Row::new(r)),
+        }
     }
 }
 
 /// A collaborative model: the evaluation engine running directly on stably addressed storage.
 pub type CollabModel<'a> = Model<'a, Stable>;
-
-/// Reads that stable addressing has to answer for itself, because a column property is a span
-/// register rather than a record per column.
-impl CollabModel<'_> {
-    pub fn get_column_style(&self, sheet: u32, column: i32) -> Result<Option<Style>, String> {
-        match self.workbook.worksheet(sheet)?.get_column_style(column)? {
-            Some(index) => self.workbook.styles.get_style(index).map(Some),
-            None => Ok(None),
-        }
-    }
-}
 
 /// The replica-local half of a [`CollabModel`]: who we are, and what we have not shipped yet.
 #[derive(Debug, Default)]
@@ -591,10 +515,11 @@ pub struct CollabSession {
     pub session: SessionId,
     /// Commits produced locally and not yet handed to the log.
     pub pending: Vec<Commit>,
-    /// When applying a redo operation, row/column insertion could look like tail append, which
-    /// would potentially skip formula lowering, when in fact it should be evaluated. This field
-    /// prevents that.
-    pub(crate) revived: bool,
+    /// What the commit being applied changed that lowered formulas depend on.
+    pub(crate) dirty: Dirty,
+    /// How each live defined name lowers into a formula, as of the last commit: a name whose view
+    /// changes re-lowers its users.
+    pub(crate) name_views: Vec<(DefinedNameId, NameView)>,
     /// Whenever formula couldn't bind name to specific defined_name_id or sheet_id (eg. because
     /// they were not created yet) it will land here and rebound when an object with relevant name
     /// has been defined.
@@ -603,6 +528,26 @@ pub struct CollabSession {
     #[cfg(test)]
     pub(crate) full_resyncs: u64,
 }
+
+/// What a commit changed that lowered formulas read, collected while its patches apply and
+/// consumed once at its end.
+#[derive(Debug, Default)]
+pub(crate) struct Dirty {
+    /// Sheets whose rows or columns moved other than by a tail append, or that were added, deleted,
+    /// renamed or moved in the tab order: their `referenced_by` entries re-lower.
+    pub(crate) sheets: HashSet<SheetId>,
+    /// Defined names whose lowered form may have changed: their users re-lower.
+    pub(crate) names: HashSet<DefinedNameId>,
+    /// Whether a sheet or a name appeared, went or was renamed, so unbound names may resolve
+    /// differently.
+    pub(crate) unbound: bool,
+    /// Whether the defined names and the parse tables need re-deriving.
+    pub(crate) structural: bool,
+}
+
+/// What a defined name lowers to inside a formula: its display name, the position of its scope
+/// sheet (`None` when global, `Some(None)` when the sheet is gone) and the text of its body.
+pub(crate) type NameView = (String, Option<Option<u32>>, String);
 
 impl CollabModel<'static> {
     /// An empty replica: a workbook with **no sheets at all**, since every sheet arrives as a
@@ -670,18 +615,6 @@ impl CollabModel<'_> {
     pub(crate) fn suffix(&self) -> [u8; SESSION_SUFFIX_LEN] {
         self.local.session.to_be_bytes()
     }
-
-    /// Ordering context for a brand new sheet, minting with this replica's session.
-    pub(crate) fn new_indexes(&self) -> SheetIndexes {
-        let suffix = self.suffix();
-        SheetIndexes {
-            rows: FractionalIndex::new(vec![], vec![], suffix),
-            cols: FractionalIndex::new(vec![], vec![], suffix),
-            registers: Default::default(),
-            parents: Default::default(),
-            spills: Default::default(),
-        }
-    }
 }
 
 // Two of these build stable storage out of an ordinal model, through a helper `collab-test` gates.
@@ -689,19 +622,7 @@ impl CollabModel<'_> {
 mod test {
     use super::*;
     use crate::cf_types::{CfRuleInput, ValueOperator};
-    use crate::types::{Cell, Color, Comment, Dxf, Fill, Row, SheetState, Worksheet};
-
-    /// Explicit session suffixes: the default is all zeroes, which is the suffix reserved for
-    /// [`virtual_key`](crate::collab::fractional_index::virtual_key).
-    fn new_indexes() -> SheetIndexes {
-        SheetIndexes {
-            rows: FractionalIndex::new(vec![], vec![], [b'r', 0, 0, 0]),
-            cols: FractionalIndex::new(vec![], vec![], [b'c', 0, 0, 0]),
-            registers: Default::default(),
-            parents: Default::default(),
-            spills: Default::default(),
-        }
-    }
+    use crate::types::{Cell, Color, Dxf, Fill, Row, SheetData, SheetState, Worksheet};
 
     fn mint(index: &mut FractionalIndex, count: usize) -> Vec<FractionalKey> {
         (0..count)
@@ -711,36 +632,50 @@ mod test {
 
     #[test]
     fn stable_worksheet_round_trip() {
-        let mut index = new_indexes();
+        let mut index = StableIndexes::new([b'x', 0, 0, 0]);
         let rows = mint(&mut index.rows, 5);
         let cols = mint(&mut index.cols, 3);
 
-        let mut sheet_data = crate::types::SheetData::<Stable>::default();
-        for (r, row_key) in rows.iter().enumerate() {
-            for (c, col_key) in cols.iter().enumerate() {
-                sheet_data.insert_cell(
-                    row_key.clone(),
-                    col_key.clone(),
-                    Cell::NumberCell {
-                        v: (10 * r + c) as f64,
-                        s: 0,
-                    },
-                );
+        // Cells sit at the ordinal their keys have in the index.
+        let mut sheet_data = SheetData::new();
+        for r in 0..rows.len() {
+            for c in 0..cols.len() {
+                let cell = Cell::NumberCell {
+                    v: (10 * r + c) as f64,
+                    s: 0,
+                };
+                sheet_data.set_cell(r as i32 + 1, c as i32 + 1, cell);
             }
         }
 
-        let mut ws = Worksheet::<Stable> {
-            dimension: "A1:C5".to_string(),
-            cols: vec![Col::<Stable> {
-                min: cols[1].clone(),
-                max: cols[1].clone(),
+        // The keyed sources live in the index, and travel with it.
+        let mut index = index;
+        index.col_spans.insert(
+            (cols[1].clone(), cols[1].clone()),
+            ColSpan {
                 width: 42.0,
                 custom_width: true,
                 hidden: false,
                 style: Some(0),
-            }],
-            rows: vec![Row::<Stable> {
-                r: rows[2].clone(),
+            },
+        );
+        index.merges.push(StableRange {
+            rows: Some((rows[0].clone(), rows[1].clone())),
+            cols: Some((cols[0].clone(), cols[1].clone())),
+        });
+        index.comments.insert(
+            (rows[3].clone(), cols[2].clone()),
+            CommentBody {
+                text: "note".to_string(),
+                author_name: "me".to_string(),
+                author_id: None,
+            },
+        );
+        let mut ws = Worksheet::<Stable> {
+            dimension: "A1:C5".to_string(),
+            cols: vec![],
+            rows: vec![Row {
+                r: 3,
                 height: 21.0,
                 custom_format: false,
                 custom_height: true,
@@ -753,16 +688,8 @@ mod test {
             sheet_id: 1,
             state: SheetState::Visible,
             color: Color::None,
-            merged_cells: vec![StableRange {
-                rows: Some((rows[0].clone(), rows[1].clone())),
-                cols: Some((cols[0].clone(), cols[1].clone())),
-            }],
-            comments: vec![Comment::<Stable> {
-                text: "note".to_string(),
-                author_name: "me".to_string(),
-                author_id: None,
-                cell_ref: (rows[3].clone(), cols[2].clone()),
-            }],
+            merged_cells: vec![],
+            comments: vec![],
             frozen_rows: 0,
             frozen_columns: 0,
             show_grid_lines: true,
@@ -788,44 +715,47 @@ mod test {
         assert_eq!(Stable::row_at(&ws.index, 0), None);
         assert_eq!(Stable::row_at(&ws.index, 6), None);
 
-        // 2. An ordinal read is a resolution followed by a lookup by identity.
-        let cell_at = |ws: &Worksheet<Stable>, row: i32, col: i32| {
-            let r = Stable::row_at(&ws.index, row)?;
-            let c = Stable::col_at(&ws.index, col)?;
-            ws.sheet_data.cell(&r, &c).cloned()
+        // 2. A read by keys is a resolution followed by a read by ordinal.
+        let cell_at = |ws: &Worksheet<Stable>, row: &FractionalKey, col: &FractionalKey| {
+            let r = Stable::row_ordinal(&ws.index, row)?;
+            let c = Stable::col_ordinal(&ws.index, col)?;
+            ws.sheet_data.cell(r, c).map(|cell| cell.into_owned())
         };
-        assert_eq!(cell_at(&ws, 2, 3), Some(Cell::NumberCell { v: 12.0, s: 0 }));
+        let number = |v: f64| Some(Cell::NumberCell { v, s: 0 });
+        assert_eq!(cell_at(&ws, &rows[1], &cols[2]), number(12.0));
 
-        // 3. A move renames positions, never identities: the cells stay exactly where they were
-        //    filed and only the ordinals they answer to change.
-        let before = ws.sheet_data.clone();
+        // 3. A move of the index is followed by the same move of the cells, so each cell keeps the
+        //    keys it was written under.
         ws.index.rows.move_to(0..1, 5); // first row to the end
-        assert_eq!(ws.sheet_data, before);
+        ws.sheet_data.move_row(1, 5);
+        ws.rows[0].r = 2; // and so does the row record
         assert_eq!(Stable::row_ordinal(&ws.index, &rows[0]), Some(5));
         assert_eq!(Stable::row_ordinal(&ws.index, &rows[1]), Some(1));
-        assert_eq!(cell_at(&ws, 5, 3), Some(Cell::NumberCell { v: 2.0, s: 0 }));
-        assert_eq!(cell_at(&ws, 1, 3), Some(Cell::NumberCell { v: 12.0, s: 0 }));
+        assert_eq!(cell_at(&ws, &rows[0], &cols[2]), number(2.0));
+        assert_eq!(cell_at(&ws, &rows[1], &cols[2]), number(12.0));
+        assert_eq!(ws.sheet_data.cell(5, 3).as_deref(), number(2.0).as_ref());
 
-        // 4. A removal takes the key out of the ordering and shifts everything after it up.
+        // 4. A removal takes the key out of the ordering and its row out of the cells, shifting
+        //    everything after it up.
         ws.index.rows.remove_key(&rows[1]);
+        ws.sheet_data.remove_rows(1, 1);
+        ws.rows[0].r = 1;
         assert_eq!(Stable::row_ordinal(&ws.index, &rows[1]), None);
         assert_eq!(Stable::row_ordinal(&ws.index, &rows[2]), Some(1));
         assert_eq!(Stable::row_ordinal(&ws.index, &rows[0]), Some(4));
+        assert_eq!(cell_at(&ws, &rows[2], &cols[2]), number(22.0));
 
         // 5. The whole sheet survives bitcode, ordering context included.
         let decoded: Worksheet<Stable> = bitcode::decode(&bitcode::encode(&ws)).unwrap();
         assert_eq!(decoded, ws);
         assert_eq!(Stable::row_ordinal(&decoded.index, &rows[2]), Some(1));
         assert_eq!(Stable::col_at(&decoded.index, 3).as_ref(), Some(&cols[2]));
-        assert_eq!(
-            cell_at(&decoded, 1, 3),
-            Some(Cell::NumberCell { v: 22.0, s: 0 })
-        );
+        assert_eq!(cell_at(&decoded, &rows[2], &cols[2]), number(22.0));
     }
 
     #[test]
     fn stable_range_resolve_and_clamp() {
-        let mut index = new_indexes();
+        let mut index = StableIndexes::new([b'x', 0, 0, 0]);
         let rows = mint(&mut index.rows, 6);
         let cols = mint(&mut index.cols, 4);
 
@@ -868,16 +798,16 @@ mod test {
 
     #[test]
     fn stable_col_span_semantics() {
-        let mut index = new_indexes();
+        let mut index = StableIndexes::new([b'x', 0, 0, 0]);
         let cols = mint(&mut index.cols, 6);
-        let span = |min: &FractionalKey, max: &FractionalKey| Col::<Stable> {
-            min: min.clone(),
-            max: max.clone(),
-            width: 20.0,
-            custom_width: true,
-            hidden: false,
-            style: None,
-        };
+        // A span resolves as a range's column axis does.
+        struct Span(FractionalKey, FractionalKey);
+        impl Span {
+            fn resolve(&self, index: &StableIndexes) -> Option<(i32, i32)> {
+                resolve_axis(&index.cols, &Some((self.0.clone(), self.1.clone())))
+            }
+        }
+        let span = |min: &FractionalKey, max: &FractionalKey| Span(min.clone(), max.clone());
         let wide = span(&cols[0], &cols[3]);
         assert_eq!(wide.resolve(&index), Some((1, 4)));
 
@@ -1006,20 +936,19 @@ mod test {
         );
     }
 
-    /// The row read gives what `Position::cell` gives column by column, whichever way it walks.
+    /// Spills share the store with authored cells: the row read gives what `cell` gives column by
+    /// column, past the index's tail included.
     #[test]
     fn cells_in_row_between_reads_as_cell_does() {
-        let mut index = new_indexes();
+        let mut index = StableIndexes::new([b'x', 0, 0, 0]);
         mint(&mut index.rows, 3);
         mint(&mut index.cols, 8);
-        // The first two columns to the end: column key order is no longer display order.
-        index.cols.move_to(0..2, 8);
         let mut ws = Worksheet::<Stable> {
             dimension: String::new(),
             cols: vec![],
             rows: vec![],
             name: "Stable".to_string(),
-            sheet_data: CellMap::default(),
+            sheet_data: SheetData::new(),
             shared_formulas: vec![],
             sheet_id: 1,
             state: SheetState::Visible,
@@ -1034,50 +963,41 @@ mod test {
             index,
         };
         let number = |v: f64| Cell::NumberCell { v, s: 0 };
+        let spill = |v: f64| Cell::SpillCell {
+            a: (2, 1),
+            s: 0,
+            v: crate::types::SpillValue::Number(v),
+        };
         for (column, cell) in [
             (1, number(1.0)),
             (3, number(3.0)),
             (4, Cell::EmptyCell { s: 0 }),
+            (5, spill(5.0)),
             (6, number(6.0)),
             (8, number(8.0)),
+            (10, spill(10.0)),
         ] {
-            Stable::store_cell(&mut ws, 2, column, cell).unwrap();
-        }
-        // Over an empty cell, over nothing, under a stored value, past the index, other rows.
-        for (row, column) in [(2, 4), (2, 5), (2, 6), (2, 10), (1, 3), (3, 2)] {
-            ws.index
-                .spills
-                .insert(row, column, number(f64::from(100 * row + column)))
-                .unwrap();
+            ws.update_cell(2, column, cell).unwrap();
         }
 
-        // 5 cells in row 2: ranges of 1 to 4 columns look columns up, wider ones walk the cells.
-        let ranges = [
-            (1, 8),
-            (0, 12),
-            (3, 4),
-            (4, 6),
-            (5, 5),
-            (9, 10),
-            (4, 3),
-            (-3, 2),
-        ];
-        for row in [0, 1, 2, 3, 4] {
-            for (first, last) in ranges {
-                let read: Vec<_> = Stable::cells_in_row_between(&ws, row, first, last)
+        for row in [1, 2, 3, 4] {
+            for (first, last) in [(1, 8), (0, 12), (3, 4), (4, 6), (5, 5), (9, 10), (4, 3)] {
+                let read: Vec<_> = ws
+                    .sheet_data
+                    .cells_in_row_between(row, first, last)
                     .map(|(column, cell)| (column, cell.into_owned()))
                     .collect();
                 let expected: Vec<_> = (first..=last)
-                    .filter_map(|column| {
-                        Some((column, Stable::cell(&ws, row, column)?.into_owned()))
-                    })
+                    .filter_map(|column| Some((column, ws.cell(row, column)?.into_owned())))
                     .collect();
                 assert_eq!(read, expected, "row {row}, columns {first}..={last}");
             }
         }
-        let read: Vec<_> = Stable::cells_in_row_between(&ws, 2, 1, 8)
+        let read: Vec<_> = ws
+            .sheet_data
+            .cells_in_row_between(2, 1, 10)
             .map(|(column, _)| column)
             .collect();
-        assert_eq!(read, vec![1, 3, 4, 5, 6, 8]);
+        assert_eq!(read, vec![1, 3, 4, 5, 6, 8, 10]);
     }
 }

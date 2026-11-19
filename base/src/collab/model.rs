@@ -91,7 +91,7 @@ impl Position for Stable {
         column: i32,
         replaced: Option<&Cell>,
     ) {
-        sheet.index.spilled.0 = true;
+        sheet.index.spills.0.push((row, column));
         if let Some(Cell::EmptyCell { s }) = replaced {
             if *s != 0 {
                 sheet.index.covered.insert((row, column), *s);
@@ -100,18 +100,18 @@ impl Position for Stable {
     }
 
     fn drop_spills(sheet: &mut Worksheet<Stable>) {
-        if !sheet.index.spilled.0 {
-            return;
-        }
-        let spills: Vec<(i32, i32)> = (sheet.sheet_data.cells())
-            .filter(|(_, _, cell)| matches!(**cell, Cell::SpillCell { .. }))
-            .map(|(row, column, _)| (row, column))
-            .collect();
-        for (row, column) in spills {
-            Stable::uncover(sheet, row, column);
+        let mut spills = std::mem::take(&mut sheet.index.spills.0);
+        // Stale or repeated entries no longer hold a spill: skip them.
+        for &(row, column) in &spills {
+            let cell = sheet.sheet_data.cell(row, column);
+            if matches!(cell.as_deref(), Some(Cell::SpillCell { .. })) {
+                Stable::uncover(sheet, row, column);
+            }
         }
         sheet.index.covered.clear();
-        sheet.index.spilled.0 = false;
+        // Keep the capacity for the next evaluate.
+        spills.clear();
+        sheet.index.spills.0 = spills;
     }
 
     fn clear_spill(sheet: &mut Worksheet<Stable>, row: i32, column: i32) -> Result<(), String> {
@@ -205,9 +205,10 @@ pub struct StableIndexes {
     /// Each conditional formatting rule's ranges, by rule key; the rule's ordinal ranges are
     /// derived from them.
     pub cf_ranges: HashMap<FractionalKey, Vec<StableRange>>,
-    /// Whether the sheet may hold a spill cell, so that dropping them can skip the scan.
+    /// Where spills were written since the last drop; may list a slot twice or one that has since
+    /// been overwritten. Rebuilt by one scan on decode.
     #[bitcode(skip)]
-    pub spilled: Hint<bool>,
+    pub spills: Hint<Vec<(i32, i32)>>,
     /// Whether a reorder this commit moved something the sheet's formulas may reference: set when
     /// the index's [`Reorder`](super::fractional_index::Reorder)s are followed, swept into
     /// [`Dirty::sheets`] at the end of the commit.

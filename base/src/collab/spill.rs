@@ -120,6 +120,8 @@ pub(crate) mod test {
             let index = &sheet.index;
             for (row, column, cell) in sheet.sheet_data.cells() {
                 if matches!(*cell, Cell::SpillCell { .. }) {
+                    let listed = index.spills.0.contains(&(row, column));
+                    assert!(listed, "spill at ({row}, {column}) is not listed");
                     continue;
                 }
                 let keys = (

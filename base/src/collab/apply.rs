@@ -101,8 +101,11 @@ impl Snapshot for CollabModel<'static> {
         }
         for sheet in &mut model.workbook.worksheets {
             rebuild_touched(&mut sheet.index);
-            // A snapshot may hold spills.
-            sheet.index.spilled.0 = true;
+            // A snapshot may hold spills: list them once.
+            sheet.index.spills.0 = (sheet.sheet_data.cells())
+                .filter(|(_, _, cell)| matches!(**cell, Cell::SpillCell { .. }))
+                .map(|(row, column, _)| (row, column))
+                .collect();
         }
         model.index_unresolved();
         // Re-derives what the payload already holds, as the baseline later commits compare with.

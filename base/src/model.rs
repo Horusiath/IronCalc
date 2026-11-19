@@ -2828,7 +2828,7 @@ impl<'a> Model<'a> {
                                 .styles
                                 .get_style_without_quote_prefix(new_style_index_spill)?;
                         }
-                        self.workbook.worksheet_mut(sheet)?.update_cell(
+                        self.workbook.worksheet_mut(sheet)?.write_spill(
                             r,
                             c,
                             Cell::SpillCell {

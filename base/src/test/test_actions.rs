@@ -201,8 +201,11 @@ fn test_delete_columns() {
     // A long as the borders of the range are not included that's ok.
     assert_eq!(model._get_formula("A2"), *"=SUM(C4:K4)");
 
-    // FIXME: In Excel this would be (lower limit won't change)
-    // assert_eq!(model._get_formula("A3"), *"=SUM(E4:K4)");
+    // The low corner E was deleted. The collab model shrinks the range to the surviving cells, as
+    // Excel does; the ordinal model's displacement still prints a `#REF!` corner.
+    #[cfg(feature = "collab-test")]
+    assert_eq!(model._get_formula("A3"), *"=SUM(D4:K4)");
+    #[cfg(not(feature = "collab-test"))]
     assert_eq!(model._get_formula("A3"), *"=SUM(#REF!:K4)");
 }
 

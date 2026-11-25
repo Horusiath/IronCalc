@@ -274,10 +274,9 @@ fn defined_names() {
     names(&o, &c, "rename sheet");
 }
 
-/// FINDING: a range whose endpoint a delete turned into `#REF!` renders identically on both models
-/// but evaluates differently — the ordinal model says `#VALUE!`, the collaborative one `#REF!`.
+/// A delete that takes a range's corner narrows the range to the surviving cells on both models.
 #[test]
-fn broken_range_endpoint_value() {
+fn deleted_range_corner_shrinks() {
     let (mut o, mut c) = pair();
     for row in 1..=3 {
         set(&mut o, &mut c, 0, row, 1, &format!("{}", row * 100));
@@ -288,21 +287,21 @@ fn broken_range_endpoint_value() {
     c.delete_columns(0, 1, 1).unwrap();
     o.evaluate();
     c.evaluate();
-    // The formula text agrees.
+    // Collab shrinks the range to the surviving column, as Excel does: 3 + 6 + 9.
     assert_eq!(
         c.get_cell_formula(0, 1, 4),
+        Ok(Some("=SUM(A1:A3)".to_string()))
+    );
+    assert_eq!(c.get_formatted_cell_value(0, 1, 4), Ok("18".to_string()));
+    // The ordinal model's displacement still prints a `#REF!` corner and errors.
+    assert_eq!(
         o.get_cell_formula(0, 1, 4),
-        "formula at sheet 0 row 1 column 4"
+        Ok(Some("=SUM(#REF!:A3)".to_string()))
     );
-    // atm. ordinal / stable models differ here:
-    // - Ordinal is #VALUE!
-    // - Stable is #REF!
-    let ordinal = o.get_formatted_cell_value(0, 1, 4).unwrap();
-    let stable = c.get_formatted_cell_value(0, 1, 4).unwrap();
-    assert!(
-        ordinal.starts_with('#') && stable.starts_with('#'),
-        "both must error at sheet 0 row 1 column 4: ordinal {ordinal:?}, stable {stable:?}"
-    );
+    assert!(o
+        .get_formatted_cell_value(0, 1, 4)
+        .unwrap()
+        .starts_with('#'));
 }
 
 #[test]

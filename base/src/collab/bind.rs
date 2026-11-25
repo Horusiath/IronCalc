@@ -209,25 +209,31 @@ fn lower_span(
     hi: &StableAxisRef,
     host: i32,
 ) -> [Option<(bool, i32)>; 2] {
-    // TODO: eventually we want to narrow the scope of range refs that have no matching stable refs
-    //       to the closest matching position (like Excel does)
-    let corner = |axis: &StableAxisRef, open: i32| {
-        let ordinal = match axis.key.is_empty() {
-            true => open,
-            false => index.position_of(&axis.key)? as i32 + 1,
-        };
-        Some((ordinal, axis.absolute))
+    // A dead corner clamps inwards like `resolve_axis`: the low one up, the high one down.
+    let corner = |axis: &StableAxisRef, open: i32, dead: i32| match axis.key.is_empty() {
+        true => ((open, axis.absolute), true),
+        false => match index.position_of(&axis.key) {
+            Some(p) => ((p as i32 + 1, axis.absolute), true),
+            None => (
+                (index.active_index(&axis.key) as i32 + dead, axis.absolute),
+                false,
+            ),
+        },
     };
-    let (first, second) = match (corner(lo, 1), corner(hi, last)) {
-        // Concurrent moves can invert the corners; the span they bound is still the same one.
-        (Some(a), Some(b)) if a.0 > b.0 => (Some(b), Some(a)),
-        corners => corners,
-    };
+    let ((mut first, live_lo), (mut second, live_hi)) = (corner(lo, 1, 1), corner(hi, last, 0));
+    // Concurrent moves can invert the live corners; the span they bound is still the same one.
+    if live_lo && live_hi && first.0 > second.0 {
+        (first, second) = (second, first);
+    }
+    // Every cell of the span was deleted.
+    if first.0 > second.0 {
+        return [None, None];
+    }
     let relative = |(ordinal, absolute): (i32, bool)| match absolute {
         true => (true, ordinal),
         false => (false, ordinal - host),
     };
-    [first.map(relative), second.map(relative)]
+    [Some(relative(first)), Some(relative(second))]
 }
 
 impl CollabModel<'_> {
@@ -575,8 +581,7 @@ impl CollabModel<'_> {
                 let (absolute_column1, column1) = c1.unwrap_or(DEAD_AXIS);
                 let (absolute_row2, row2) = r2.unwrap_or(DEAD_AXIS);
                 let (absolute_column2, column2) = c2.unwrap_or(DEAD_AXIS);
-                // One dead corner poisons the whole rectangle, as the ordinal model's displacement
-                // does.
+                // A wholly deleted span, or a missing sheet, is `#REF!`.
                 match (at, [r1, c1, r2, c2].iter().all(Option::is_some)) {
                     (Some(sheet_index), true) => Node::RangeKind {
                         sheet_name,
@@ -1274,16 +1279,19 @@ mod test {
         same(&mut o, &mut c, 7, "rename sheet");
         assert_eq!(text(&c), "SUM(R[-6]C[-3]:R[-1]C[-3])+Data!R2C2*tax");
 
-        // The low corner's row goes: as in the ordinal model, the corner shows `#REF!`. (What the
-        // broken range evaluates to differs, see `broken_range_endpoint_value`.)
+        // The low corner's row goes: the range shrinks to the rows left, as in Excel. The ordinal
+        // model's displacement still prints a `#REF!` corner here, so the two diverge.
         c.flush();
         o.delete_rows(0, 1, 1).unwrap();
         c.delete_rows(0, 1, 1).unwrap();
         o.evaluate();
         c.evaluate();
-        assert_eq!(c.get_cell_formula(0, 6, 4), o.get_cell_formula(0, 6, 4));
         assert_eq!(
             c.get_cell_formula(0, 6, 4),
+            Ok(Some("=SUM(A1:A5)+Data!$B$2*tax".to_string()))
+        );
+        assert_eq!(
+            o.get_cell_formula(0, 6, 4),
             Ok(Some("=SUM(#REF!:A5)+Data!$B$2*tax".to_string()))
         );
 
@@ -1391,5 +1399,49 @@ mod test {
         c.evaluate();
         assert_eq!(c.get_cell_formula(0, 1, 3), Ok(Some("=A3".to_string())));
         assert_eq!(c.get_formatted_cell_value(0, 1, 3), Ok("5".to_string()));
+    }
+
+    /// The model for the range-shrink tests: `A1:C1 = 1, 2, 3` and `formula` in E1.
+    fn range_model(formula: &str) -> CollabModel<'static> {
+        let mut c = CollabModel::new(1);
+        c.new_sheet();
+        for (column, value) in [(1, "1"), (2, "2"), (3, "3"), (5, formula)] {
+            c.set_user_input(0, 1, column, value.to_string()).unwrap();
+        }
+        c.flush();
+        c
+    }
+
+    /// Both corners die in two deletes, but the middle column survives: the range shrinks to it.
+    #[test]
+    fn range_with_both_corners_deleted_keeps_its_middle() {
+        let mut c = range_model("=SUM(A1:C1)");
+        c.delete_columns(0, 1, 1).unwrap();
+        // The old C is now B.
+        c.delete_columns(0, 2, 1).unwrap();
+        c.evaluate();
+        assert_eq!(
+            c.get_cell_formula(0, 1, 3),
+            Ok(Some("=SUM(A1:A1)".to_string()))
+        );
+        assert_eq!(c.get_formatted_cell_value(0, 1, 3), Ok("2".to_string()));
+    }
+
+    /// A range whose every cell is deleted is `#REF!`, and the undo brings it back whole.
+    #[test]
+    fn deleted_range_comes_back_on_undo() {
+        let mut c = range_model("=SUM(B1:C1)");
+        c.delete_columns(0, 2, 2).unwrap();
+        c.evaluate();
+        assert_eq!(c.get_formatted_cell_value(0, 1, 3), Ok("#REF!".to_string()));
+
+        let commits = c.flush();
+        undo(&mut c, &commits);
+        c.evaluate();
+        assert_eq!(
+            c.get_cell_formula(0, 1, 5),
+            Ok(Some("=SUM(B1:C1)".to_string()))
+        );
+        assert_eq!(c.get_formatted_cell_value(0, 1, 5), Ok("5".to_string()));
     }
 }

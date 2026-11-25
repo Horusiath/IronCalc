@@ -16,45 +16,42 @@ pub(crate) fn cf_anchor(ranges: &[RangeRef]) -> Option<(i32, i32)> {
 }
 
 impl CollabModel<'_> {
-    /// Prints every rule's bound formula slots back into the strings the rule carries, against the
-    /// anchor the rule's ranges currently sit at.
-    pub(crate) fn normalize_cf(&mut self) {
-        for i in 0..self.workbook.worksheets.len() {
-            for at in 0..self.workbook.worksheets[i].conditional_formatting.len() {
-                let sheet = &self.workbook.worksheets[i];
-                let Some(key) = sheet.index.registers.cf_order.get(at) else {
-                    continue;
-                };
-                let Some(bodies) = sheet.index.registers.cf_formulas.get(key).cloned() else {
-                    continue;
-                };
-                // A rule whose ranges all collapsed formats nothing, so there is no anchor to
-                // print against and nothing to show.
-                let Some((row, column)) = cf_anchor(&sheet.conditional_formatting[at].ranges)
-                else {
-                    continue;
-                };
-                let context = CellReferenceRC {
-                    sheet: sheet.get_name(),
-                    row,
-                    column,
-                };
-                let host = Host::relative(i as u32, row, column);
-                let texts: Vec<String> = bodies
-                    .iter()
-                    .map(|body| {
-                        let node = self.lower(&body.formula.text, &body.formula.refs, &host);
-                        let text = to_english_string(&node, &context);
-                        match body.equals {
-                            true => format!("={text}"),
-                            false => text,
-                        }
-                    })
-                    .collect();
-                let rule = &mut self.workbook.worksheets[i].conditional_formatting[at].cf_rule;
-                for (slot, text) in rule.formulas_mut().into_iter().zip(texts) {
-                    *slot = text;
-                }
+    /// Prints every rule's bound formula slots of worksheet `i` back into the strings the rule
+    /// carries, against the anchor the rule's ranges currently sit at.
+    pub(crate) fn normalize_cf(&mut self, i: usize) {
+        for at in 0..self.workbook.worksheets[i].conditional_formatting.len() {
+            let sheet = &self.workbook.worksheets[i];
+            let Some(key) = sheet.index.registers.cf_order.get(at) else {
+                continue;
+            };
+            let Some(bodies) = sheet.index.registers.cf_formulas.get(key).cloned() else {
+                continue;
+            };
+            // A rule whose ranges all collapsed formats nothing, so there is no anchor to print
+            // against and nothing to show.
+            let Some((row, column)) = cf_anchor(&sheet.conditional_formatting[at].ranges) else {
+                continue;
+            };
+            let context = CellReferenceRC {
+                sheet: sheet.get_name(),
+                row,
+                column,
+            };
+            let host = Host::relative(i as u32, row, column);
+            let texts: Vec<String> = bodies
+                .iter()
+                .map(|body| {
+                    let node = self.lower(&body.formula.text, &body.formula.refs, &host);
+                    let text = to_english_string(&node, &context);
+                    match body.equals {
+                        true => format!("={text}"),
+                        false => text,
+                    }
+                })
+                .collect();
+            let rule = &mut self.workbook.worksheets[i].conditional_formatting[at].cf_rule;
+            for (slot, text) in rule.formulas_mut().into_iter().zip(texts) {
+                *slot = text;
             }
         }
     }
@@ -296,6 +293,30 @@ mod test {
         assert_eq!(list(&a)[0].range, "A1:A4");
         // The reference is relative, so the row now first still looks at `Info!A1`.
         assert_eq!(color_at(&a, 1, 1), Color::Rgb("#FF0000".to_string()));
+    }
+
+    #[test]
+    fn cf_text_follows_a_referenced_sheet_reorder() {
+        let (mut a, mut b) = (peer(1), peer(2));
+        a.new_sheet().unwrap();
+        a.new_sheet().unwrap();
+        a.set_user_input(1, 2, 1, "9").unwrap();
+        a.add_conditional_formatting(0, "A1:A5", formula_rule("=Sheet2!A2>0", fill("#FF0000")))
+            .unwrap();
+        // Only sheet 1 moves; the rule on sheet 0 still prints the row it follows.
+        a.insert_rows(1, 1, 1).unwrap();
+        deliver(&mut a, &mut b);
+        let (mut expected, _) = formula_rule("=Sheet2!A3>0", fill("#FF0000")).split();
+        if let Some(slot) = expected.dxf_id_mut() {
+            *slot = 0;
+        }
+        for model in [&a, &b] {
+            let mut rule = list(model)[0].cf_rule.clone();
+            if let Some(slot) = rule.dxf_id_mut() {
+                *slot = 0;
+            }
+            assert_eq!(rule, expected);
+        }
     }
 
     #[test]

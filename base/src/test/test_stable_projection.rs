@@ -4,7 +4,7 @@
 //! and projected straight back has to be the worksheet we started with, field for field.
 
 use crate::cf_types::{CfRuleInput, ValueOperator};
-use crate::collab::model::CollabModel;
+use crate::collab::model::{CollabModel, Derive};
 use crate::test::util::new_empty_model;
 use crate::types::{Col, Color, Comment, Dxf, Fill, MergedCell, RangeRef, Worksheet};
 
@@ -153,7 +153,7 @@ fn projection_identity() {
     }
     records.sort_by_key(|row| row.r);
     // ...and the sparse items re-derived from their keys, as the end of a commit does.
-    a.derive_sparse(0);
+    a.derive_sparse(0, Derive::ALL);
     let projected = a.to_ordinal_workbook();
     let moved = &projected.worksheets[0];
     assert_ne!(moved.sheet_data, out.sheet_data);

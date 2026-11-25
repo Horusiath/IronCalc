@@ -214,6 +214,9 @@ pub struct StableIndexes {
     /// [`Dirty::sheets`] at the end of the commit.
     #[bitcode(skip)]
     pub reordered: Hint<bool>,
+    /// Derived records a commit's writes invalidated; swept by `resync_derived`.
+    #[bitcode(skip)]
+    pub(crate) derive: Hint<Derive>,
     /// `formulas[f]` describes `shared_formulas[f]`: the cell its text is relative to, and its
     /// slots.
     pub formulas: Vec<FormulaRefs>,
@@ -288,6 +291,36 @@ pub struct Hint<T>(pub T);
 impl<T> PartialEq for Hint<T> {
     fn eq(&self, _other: &Self) -> bool {
         true
+    }
+}
+
+/// Which derived records of a sheet a commit invalidated. See `derive_sparse`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Derive(u8);
+
+impl Derive {
+    pub(crate) const NONE: Derive = Derive(0);
+    pub(crate) const COLS: Derive = Derive(1);
+    pub(crate) const MERGES: Derive = Derive(2);
+    pub(crate) const COMMENTS: Derive = Derive(4);
+    pub(crate) const LINKS: Derive = Derive(8);
+    pub(crate) const CF: Derive = Derive(16);
+    pub(crate) const ALL: Derive = Derive(31);
+
+    pub(crate) fn has(self, flag: Derive) -> bool {
+        self.0 & flag.0 != 0
+    }
+
+    /// How many records the flags name.
+    #[cfg(test)]
+    pub(crate) fn count(self) -> u64 {
+        self.0.count_ones() as u64
+    }
+}
+
+impl std::ops::BitOrAssign for Derive {
+    fn bitor_assign(&mut self, rhs: Derive) {
+        self.0 |= rhs.0
     }
 }
 

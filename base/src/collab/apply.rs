@@ -23,8 +23,8 @@ use crate::collab::fractional_index::{
 use crate::collab::hlc::Hlc;
 use crate::collab::log::{Commit, Consumer, Lww, SessionId, Snapshot, Timestamp};
 use crate::collab::model::{
-    resolve_axis, ColSpan, CollabModel, Dirty, NameView, SheetRegisters, Stable, StableCellAddress,
-    StableIndexes, StableLink,
+    resolve_axis, ColSpan, CollabModel, Derive, Dirty, NameView, SheetRegisters, Stable,
+    StableCellAddress, StableIndexes, StableLink,
 };
 use crate::collab::naming::NameRepair;
 use crate::collab::patch::{
@@ -113,7 +113,7 @@ impl Snapshot for CollabModel<'static> {
         model.refresh_parse_tables();
         model.lower_all();
         for i in 0..model.workbook.worksheets.len() {
-            model.derive_sparse(i);
+            model.derive_sparse(i, Derive::ALL);
         }
         Ok(model)
     }
@@ -590,6 +590,26 @@ fn derive_cols(index: &StableIndexes) -> Vec<Col> {
     // Sorted by span, so that on a tie of stamps the first span wins, whatever the map's order.
     let mut spans: Vec<_> = index.col_spans.iter().collect();
     spans.sort_by_key(|&(span, _)| span);
+    /// The newest stamp of each property of one span.
+    #[derive(Default)]
+    struct Stamps {
+        width: Option<Timestamp>,
+        hidden: Option<Timestamp>,
+        style: Option<Timestamp>,
+    }
+    // One pass over the registers, rather than a lookup per span and kind.
+    let mut stamps: HashMap<&(FractionalKey, FractionalKey), Stamps> =
+        HashMap::with_capacity(index.col_spans.len());
+    for ((span, kind), ts) in registers {
+        let s = stamps.entry(span).or_default();
+        match kind {
+            PropKind::Width => s.width = Some(*ts),
+            PropKind::Hidden => s.hidden = Some(*ts),
+            // Not in `PropKind::STYLE`: a column has no height, and a span no named style.
+            PropKind::Height | PropKind::StyleRef => {}
+            _ => s.style = s.style.max(Some(*ts)),
+        }
+    }
     struct Covering<'a> {
         interval: Option<(i32, i32)>,
         open: bool,
@@ -601,14 +621,16 @@ fn derive_cols(index: &StableIndexes) -> Vec<Col> {
     let spans: Vec<Covering> = spans
         .into_iter()
         .map(|(span, state)| {
-            let stamp = |kind| registers.get(&(span.clone(), kind)).copied();
+            let (width, hidden, style) = stamps
+                .get(span)
+                .map_or((None, None, None), |s| (s.width, s.hidden, s.style));
             Covering {
                 interval: resolve_axis(&index.cols, &Some(span.clone())),
                 open: span.1.is_empty(),
                 state,
-                width: stamp(PropKind::Width),
-                hidden: stamp(PropKind::Hidden),
-                style: PropKind::STYLE.into_iter().filter_map(stamp).max(),
+                width,
+                hidden,
+                style,
             }
         })
         .collect();
@@ -1083,11 +1105,16 @@ impl CollabModel<'_> {
             self.refresh_parse_tables();
         }
         self.relower_dirty(&dirty);
-        // Sparse items are few: every sheet is re-derived, with no tracking of what moved.
+        // A structural commit may move what any sheet's links and CF formulas print.
         for i in 0..self.workbook.worksheets.len() {
-            self.derive_sparse(i);
+            let mut flags = std::mem::take(&mut self.workbook.worksheets[i].index.derive.0);
+            if dirty.structural {
+                flags = Derive::ALL;
+            }
+            if flags != Derive::NONE {
+                self.derive_sparse(i, flags);
+            }
         }
-        self.normalize_cf();
     }
 
     /// The parser reads sheets and defined names by their display names, and the evaluator reads
@@ -1214,11 +1241,11 @@ impl CollabModel<'_> {
         }
     }
 
-    /// Rewrites the ordinal `cols`, `merged_cells`, `comments`, `links` and conditional formatting
-    /// ranges of worksheet `i` from their keyed sources in its index. A pure function of the
-    /// sources and the index, in a fixed order, so replicas holding equal sources hold equal
-    /// worksheets.
-    pub(crate) fn derive_sparse(&mut self, i: usize) {
+    /// Rewrites the ordinal records `flags` name of worksheet `i` from their keyed sources in its
+    /// index: `cols`, `merged_cells`, `comments`, `links`, and the conditional formatting ranges
+    /// and formula strings. A pure function of the sources and the index, in a fixed order, so
+    /// replicas holding equal sources hold equal worksheets.
+    pub(crate) fn derive_sparse(&mut self, i: usize, flags: Derive) {
         let sheet = &self.workbook.worksheets[i];
         let index = &sheet.index;
         let at = |(row, col): &StableCellAddress| {
@@ -1226,46 +1253,67 @@ impl CollabModel<'_> {
             let column = index.cols.position_of(col)? as i32 + 1;
             Some((row, column))
         };
-        let cols = derive_cols(index);
-        let merged_cells = (index.merges.iter())
-            .filter_map(|range| {
-                let (row, column, last_row, last_column) = range.merged_rect(index)?;
-                Some(MergedCell {
-                    row,
-                    column,
-                    width: last_column - column + 1,
-                    height: last_row - row + 1,
+        let cols = flags.has(Derive::COLS).then(|| derive_cols(index));
+        let merged_cells = flags.has(Derive::MERGES).then(|| {
+            (index.merges.iter())
+                .filter_map(|range| {
+                    let (row, column, last_row, last_column) = range.merged_rect(index)?;
+                    Some(MergedCell {
+                        row,
+                        column,
+                        width: last_column - column + 1,
+                        height: last_row - row + 1,
+                    })
                 })
-            })
-            .collect();
-        let mut comments: Vec<Comment> = (index.comments.iter())
-            .filter_map(|(key, body)| {
-                Some(Comment {
-                    text: body.text.clone(),
-                    author_name: body.author_name.clone(),
-                    author_id: body.author_id.clone(),
-                    cell_ref: at(key)?,
+                .collect()
+        });
+        let comments = flags.has(Derive::COMMENTS).then(|| {
+            let mut comments: Vec<Comment> = (index.comments.iter())
+                .filter_map(|(key, body)| {
+                    Some(Comment {
+                        text: body.text.clone(),
+                        author_name: body.author_name.clone(),
+                        author_id: body.author_id.clone(),
+                        cell_ref: at(key)?,
+                    })
                 })
-            })
-            .collect();
-        comments.sort_by_key(|c| c.cell_ref);
-        let links = (index.links.iter())
-            .filter_map(|(key, link)| Some((at(key)?, self.link_view(link))))
-            .collect();
+                .collect();
+            comments.sort_by_key(|c| c.cell_ref);
+            comments
+        });
+        let links = flags.has(Derive::LINKS).then(|| {
+            (index.links.iter())
+                .filter_map(|(key, link)| Some((at(key)?, self.link_view(link))))
+                .collect()
+        });
         // `cf_order` is aligned with the rules, entry by entry.
-        let cf_ranges: Vec<Vec<_>> = (index.registers.cf_order.iter())
-            .map(|key| {
-                let ranges = index.cf_ranges.get(key).map(Vec::as_slice).unwrap_or(&[]);
-                ranges.iter().filter_map(|r| r.to_ordinal(index)).collect()
-            })
-            .collect();
+        let cf_ranges = flags.has(Derive::CF).then(|| {
+            (index.registers.cf_order.iter())
+                .map(|key| {
+                    let ranges = index.cf_ranges.get(key).map(Vec::as_slice).unwrap_or(&[]);
+                    ranges.iter().filter_map(|r| r.to_ordinal(index)).collect()
+                })
+                .collect::<Vec<Vec<_>>>()
+        });
         let sheet = &mut self.workbook.worksheets[i];
-        sheet.cols = cols;
-        sheet.merged_cells = merged_cells;
-        sheet.comments = comments;
-        sheet.links = links;
-        for (cf, ranges) in sheet.conditional_formatting.iter_mut().zip(cf_ranges) {
-            cf.ranges = ranges;
+        if let Some(cols) = cols {
+            sheet.cols = cols;
+        }
+        if let Some(merged_cells) = merged_cells {
+            sheet.merged_cells = merged_cells;
+        }
+        if let Some(comments) = comments {
+            sheet.comments = comments;
+        }
+        if let Some(links) = links {
+            sheet.links = links;
+        }
+        if let Some(cf_ranges) = cf_ranges {
+            for (cf, ranges) in sheet.conditional_formatting.iter_mut().zip(cf_ranges) {
+                cf.ranges = ranges;
+            }
+            // After the ranges: they give the anchor the formulas print against.
+            self.normalize_cf(i);
         }
     }
 
@@ -1571,6 +1619,7 @@ impl CollabModel<'_> {
                     return Ok(());
                 }
                 let index = &mut self.workbook.worksheets[i].index;
+                index.derive.0 |= Derive::COLS;
                 let own = index.col_spans.get(span).and_then(|c| c.style).unwrap_or(0);
                 let s = overlay(&mut self.workbook.styles, own, &won);
                 let record = index.col_spans.entry(span.clone()).or_default();
@@ -1600,6 +1649,7 @@ impl CollabModel<'_> {
                 if !wins(&mut index.registers.merges, range, ts) {
                     return Ok(());
                 }
+                index.derive.0 |= Derive::MERGES;
                 match (merged, index.merges.binary_search(range)) {
                     (true, Err(at)) => index.merges.insert(at, range.clone()),
                     (false, Ok(at)) => {
@@ -1618,6 +1668,7 @@ impl CollabModel<'_> {
                 if !wins(&mut index.registers.comments, at, ts) {
                     return Ok(());
                 }
+                index.derive.0 |= Derive::COMMENTS;
                 match comment {
                     Some(comment) => {
                         index.comments.insert(at.clone(), comment.clone());
@@ -1638,6 +1689,7 @@ impl CollabModel<'_> {
                 if !wins(&mut index.registers.links, at, ts) {
                     return Ok(());
                 }
+                index.derive.0 |= Derive::LINKS;
                 match link {
                     Some(link) => {
                         index.links.insert(at.clone(), link.clone());
@@ -1831,6 +1883,7 @@ impl CollabModel<'_> {
                 let cf_rule = self.install_rule(i, key, rule);
                 let sheet = &mut self.workbook.worksheets[i];
                 sheet.index.cf_ranges.insert(key.clone(), ranges.clone());
+                sheet.index.derive.0 |= Derive::CF;
                 // The ordinal ranges are derived at the end of the commit.
                 let cf = ConditionalFormatting {
                     ranges: Vec::new(),
@@ -1851,6 +1904,7 @@ impl CollabModel<'_> {
                     sheet.index.registers.cf_formulas.remove(key);
                     sheet.index.cf_ranges.remove(key);
                     sheet.conditional_formatting.remove(at);
+                    sheet.index.derive.0 |= Derive::CF;
                     rank_cf(sheet);
                 }
             }
@@ -1889,6 +1943,7 @@ impl CollabModel<'_> {
                 let Some(at) = cf_slot(sheet, key) else {
                     return Ok(());
                 };
+                sheet.index.derive.0 |= Derive::CF;
                 match property {
                     CfProperty::Rule(rule) => {
                         let cf_rule = self.install_rule(i, key, rule);
@@ -2214,7 +2269,7 @@ impl CollabModel<'_> {
                     .insert((id, at.clone()));
             }
         }
-        self.derive_sparse(i);
+        self.derive_sparse(i, Derive::ALL);
         Ok(())
     }
 

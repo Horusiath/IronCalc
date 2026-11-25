@@ -6,7 +6,7 @@ use crate::collab::log::SessionId;
 use crate::collab::model::{CollabModel, CommentBody, Stable, StableRange};
 use crate::collab::patch::{
     CellInput, CfProperty, ColState, ConditionalFormatState, NamedStyleId, Patch, RowState,
-    SheetContent, SheetIndexSeed, StableCfRule,
+    SeedCell, SeedValue, SheetContent, SheetIndexSeed, StableCfRule,
 };
 use crate::expressions::lexer::LexerMode;
 use crate::expressions::parser::Node;
@@ -74,29 +74,51 @@ pub(crate) fn content_from_ordinal(
             .map(|(lo, hi)| (virtual_key(lo as u32), virtual_key(hi as u32))),
     };
 
-    let mut cell_values = Vec::new();
-    let mut cell_styles = Vec::new();
+    let mut cells = Vec::new();
     let mut cell_parents = Vec::new();
+    // The workbook's string and style indexes, remapped to the payload's own tables.
+    let (mut strings, mut strings_map) = (Vec::new(), HashMap::<i32, u32>::new());
+    let (mut cell_styles, mut styles_map) = (Vec::new(), HashMap::<i32, u32>::new());
     for r in &ws.sheet_data.rows() {
         for (c, cell) in &ws.sheet_data.cells_in_row(*r) {
-            let at = (virtual_key(*r as u32), virtual_key(*c as u32));
-            let input = match &**cell {
-                Cell::NumberCell { v, .. } => Some(CellInput::Number(*v)),
-                Cell::BooleanCell { v, .. } => Some(CellInput::Boolean(*v)),
-                Cell::ErrorCell { ei, .. } => Some(CellInput::Error(ei.clone())),
-                Cell::SharedString { si, .. } => shared_strings
-                    .get(*si as usize)
-                    .cloned()
-                    .map(CellInput::Text),
+            let value = match &**cell {
+                Cell::NumberCell { v, .. } => Some(SeedValue::Number(*v)),
+                Cell::BooleanCell { v, .. } => Some(SeedValue::Boolean(*v)),
+                Cell::ErrorCell { ei, .. } => Some(SeedValue::Error(ei.clone())),
+                Cell::SharedString { si, .. } => match strings_map.get(si) {
+                    Some(&x) => Some(SeedValue::Text(x)),
+                    None => shared_strings.get(*si as usize).map(|text| {
+                        let x = strings.len() as u32;
+                        strings.push(text.clone());
+                        strings_map.insert(*si, x);
+                        SeedValue::Text(x)
+                    }),
+                },
                 // Formulas, array anchors included, come in the second pass; spills are derived.
                 _ => None,
             };
-            if let Some(input) = input {
-                cell_values.push((at.clone(), input));
-            }
             // Only a cell holding a style of its own: 0 is the table's default entry.
-            if cell.get_style() != 0 {
-                if let Some(xf) = styles.cell_xfs.get(cell.get_style() as usize) {
+            let s = cell.get_style();
+            let style = match (s, styles_map.get(&s)) {
+                (0, _) => None,
+                (_, Some(&x)) => Some(x),
+                _ => styles.get_style(s).ok().map(|style| {
+                    let x = cell_styles.len() as u32;
+                    cell_styles.push(style);
+                    styles_map.insert(s, x);
+                    x
+                }),
+            };
+            if value.is_some() || style.is_some() {
+                cells.push(SeedCell {
+                    row: *r as u32,
+                    column: *c as u32,
+                    value,
+                    style,
+                });
+            }
+            if s != 0 {
+                if let Some(xf) = styles.cell_xfs.get(s as usize) {
                     if xf.xf_id != 0 {
                         if let Some(id) = named.get(&xf.xf_id) {
                             let owned = StyleIncludes {
@@ -107,12 +129,10 @@ pub(crate) fn content_from_ordinal(
                                 alignment: xf.apply_alignment,
                                 protection: xf.apply_protection,
                             };
-                            cell_parents.push((at.clone(), *id, owned));
+                            let at = (virtual_key(*r as u32), virtual_key(*c as u32));
+                            cell_parents.push((at, *id, owned));
                         }
                     }
-                }
-                if let Ok(style) = styles.get_style(cell.get_style()) {
-                    cell_styles.push((at, style));
                 }
             }
         }
@@ -174,8 +194,9 @@ pub(crate) fn content_from_ordinal(
                 )
             })
             .collect(),
-        cell_values,
-        cell_styles,
+        cells,
+        styles: cell_styles,
+        strings,
         cell_parents: {
             cell_parents.sort_by(|(a, ..), (b, ..)| a.cmp(b));
             cell_parents
@@ -859,6 +880,57 @@ mod test {
             assert!(!a3.font.b && !a3.font.i);
             assert_eq!(a3.fill.color, strong.fill.color);
         }
+    }
+
+    #[test]
+    fn seed_tables_hold_each_style_and_text_once() {
+        let mut m = Model::new_empty("import", "en", "UTC", "en").unwrap();
+        let mut bold = Style::default();
+        bold.font.b = true;
+        m.set_user_input(0, 1, 1, "1".to_string()).unwrap();
+        m.set_user_input(0, 2, 1, "2".to_string()).unwrap();
+        m.set_user_input(0, 1, 2, "hi".to_string()).unwrap();
+        m.set_user_input(0, 2, 2, "hi".to_string()).unwrap();
+        m.set_cell_style(0, 1, 1, &bold).unwrap();
+        m.set_cell_style(0, 2, 1, &bold).unwrap();
+        m.set_cell_style(0, 3, 3, &bold).unwrap(); // a styled empty cell
+        m.evaluate();
+
+        let ws = &m.workbook.worksheets[0];
+        let content = content_from_ordinal(
+            ws,
+            &m.workbook.styles,
+            &m.workbook.shared_strings,
+            &HashMap::new(),
+            [0; SESSION_SUFFIX_LEN],
+        );
+        assert_eq!(content.styles, vec![bold.clone()]);
+        assert_eq!(content.strings, vec!["hi".to_string()]);
+        assert_eq!(content.cells.len(), 5);
+        assert!(
+            content
+                .cells
+                .iter()
+                .any(|cell| (cell.row, cell.column, &cell.value, cell.style)
+                    == (3, 3, &None, Some(0)))
+        );
+
+        let mut a = CollabModel::from_workbook_with_session(m.workbook.clone(), "en", 1).unwrap();
+        a.evaluate();
+        let mut b = CollabModel::new(2);
+        deliver(&mut b, &a.flush());
+        b.evaluate();
+        for peer in [&a, &b] {
+            compare(&m, peer, 3, 3, "import");
+            for (row, col) in [(1, 1), (2, 1), (1, 2), (2, 2), (3, 3)] {
+                assert_eq!(
+                    peer.get_style_for_cell(0, row, col),
+                    m.get_style_for_cell(0, row, col),
+                    "style at row {row} column {col}"
+                );
+            }
+        }
+        assert_eq!(b.get_style_for_cell(0, 3, 3), Ok(bold));
     }
 
     #[test]

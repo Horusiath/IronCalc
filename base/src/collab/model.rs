@@ -310,12 +310,6 @@ impl Derive {
     pub(crate) fn has(self, flag: Derive) -> bool {
         self.0 & flag.0 != 0
     }
-
-    /// How many records the flags name.
-    #[cfg(test)]
-    pub(crate) fn count(self) -> u64 {
-        self.0.count_ones() as u64
-    }
 }
 
 impl std::ops::BitOrAssign for Derive {

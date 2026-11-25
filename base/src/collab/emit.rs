@@ -6,6 +6,8 @@
 //! [`CollabModel::commit_local`]. There is no second path into the document: for [`Stable`] every
 //! mutation is a patch.
 
+use std::collections::HashMap;
+
 use crate::actions::interval_survives_move;
 use crate::cf_types::{CfRule, CfRuleInput};
 use crate::collab::apply::{cell_deleted, owned_categories, SHEET_NAMES};
@@ -22,8 +24,9 @@ use crate::collab::naming::{defined_name_id, stable_id};
 use crate::collab::patch::{
     CellInput, CfProperty, ColState, ColumnSnapshot, ConditionalFormatState, DefinedNameBody,
     DefinedNameId, DefinedNameProperty, NamedStyle, NamedStyleId, NamedStyleProperty, Patch,
-    PropKind, Property, RowSnapshot, RowState, SheetContent, SheetId, SheetIndexSeed,
-    SheetPropKind, SheetProperty, SheetRestore, StableCfRule, WorkbookPropKind, WorkbookProperty,
+    PropKind, Property, RowSnapshot, RowState, SeedCell, SeedValue, SheetContent, SheetId,
+    SheetIndexSeed, SheetPropKind, SheetProperty, SheetRestore, StableCfRule, WorkbookPropKind,
+    WorkbookProperty,
 };
 use crate::constants::{
     COLUMN_WIDTH_FACTOR, DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT, LAST_COLUMN, LAST_ROW,
@@ -2514,25 +2517,55 @@ impl CollabModel<'_> {
     #[allow(clippy::expect_used)]
     pub(crate) fn sheet_content(&self, i: usize) -> SheetContent {
         let sheet = &self.workbook.worksheets[i];
-        let mut cell_values = Vec::new();
-        let mut cell_styles = Vec::new();
-        for (row, col, _) in sheet.sheet_data.cells() {
-            let (Some(row), Some(col), Some(style)) = (
-                sheet.index.rows.key(row as usize - 1),
-                sheet.index.cols.key(col as usize - 1),
-                sheet.authored_style((row, col)),
-            ) else {
-                continue;
+        let mut cells = Vec::new();
+        // The replica's string and style indexes, remapped to the payload's own tables.
+        let (mut strings, mut strings_map) = (Vec::new(), HashMap::<i32, u32>::new());
+        let (mut styles, mut styles_map) = (Vec::new(), HashMap::<i32, u32>::new());
+        for (row, column, cell) in sheet.sheet_data.cells() {
+            let value = match &*cell {
+                Cell::NumberCell { v, .. } => Some(SeedValue::Number(*v)),
+                Cell::BooleanCell { v, .. } => Some(SeedValue::Boolean(*v)),
+                Cell::ErrorCell { ei, .. } => Some(SeedValue::Error(ei.clone())),
+                Cell::SharedString { si, .. } => match strings_map.get(si) {
+                    Some(&x) => Some(SeedValue::Text(x)),
+                    None => self.workbook.shared_strings.get(*si as usize).map(|text| {
+                        let x = strings.len() as u32;
+                        strings.push(text.clone());
+                        strings_map.insert(*si, x);
+                        SeedValue::Text(x)
+                    }),
+                },
+                Cell::CellFormula { .. } | Cell::ArrayFormula { .. } => match (
+                    sheet.index.rows.key(row as usize - 1),
+                    sheet.index.cols.key(column as usize - 1),
+                ) {
+                    (Some(r), Some(c)) => self
+                        .cell_input(i, &(r.clone(), c.clone()))
+                        .map(|input| SeedValue::Formula(Box::new(input))),
+                    _ => None,
+                },
+                Cell::EmptyCell { .. } | Cell::SpillCell { .. } => None,
             };
-            let at = (row.clone(), col.clone());
-            if let Some(input) = self.cell_input(i, &at) {
-                cell_values.push((at.clone(), input));
-            }
             // Only a cell holding a style of its own: 0 is the table's default entry.
-            if style != 0 {
-                if let Ok(style) = self.workbook.styles.get_style(style) {
-                    cell_styles.push((at, style));
-                }
+            let style = match sheet.authored_style((row, column)).unwrap_or(0) {
+                0 => None,
+                s => match styles_map.get(&s) {
+                    Some(&x) => Some(x),
+                    None => self.workbook.styles.get_style(s).ok().map(|style| {
+                        let x = styles.len() as u32;
+                        styles.push(style);
+                        styles_map.insert(s, x);
+                        x
+                    }),
+                },
+            };
+            if value.is_some() || style.is_some() {
+                cells.push(SeedCell {
+                    row: row as u32,
+                    column: column as u32,
+                    value,
+                    style,
+                });
             }
         }
         // References a row or column delete took along are dead: see `derive_cell`.
@@ -2609,8 +2642,9 @@ impl CollabModel<'_> {
                 columns.sort_by(|(a, _), (b, _)| a.cmp(b));
                 columns
             },
-            cell_values,
-            cell_styles,
+            cells,
+            styles,
+            strings,
             cell_parents,
             merge_cells: sheet.index.merges.clone(),
             comments: {
@@ -2935,12 +2969,14 @@ impl CollabModel<'_> {
         // The copy's keys are the source's, so an own-sheet reference keeps working as it is; only
         // one naming the source *by id* has to be pointed at the copy instead.
         let mut content = self.sheet_content(i);
-        for (_, input) in &mut content.cell_values {
-            if let CellInput::Formula(formula)
-            | CellInput::Array(formula)
-            | CellInput::Cse { formula, .. } = input
-            {
-                formula.retarget_sheet(source_id, id);
+        for cell in &mut content.cells {
+            if let Some(SeedValue::Formula(input)) = &mut cell.value {
+                if let CellInput::Formula(formula)
+                | CellInput::Array(formula)
+                | CellInput::Cse { formula, .. } = &mut **input
+                {
+                    formula.retarget_sheet(source_id, id);
+                }
             }
         }
         for (_, state) in &mut content.conditional_formatting {
@@ -6762,6 +6798,36 @@ mod test {
             b.workbook.worksheets[1].index.cols,
             a.workbook.worksheets[1].index.cols
         );
+    }
+
+    /// A copy seeds each kind of cell, a formula and a styled empty cell included, alike on a peer.
+    #[test]
+    fn duplicate_sheet_seeds_every_cell_kind() {
+        let mut a = CollabModel::new(1);
+        a.new_sheet();
+        a.set_user_input(0, 1, 1, "3".to_string()).unwrap();
+        a.set_user_input(0, 2, 1, "hi".to_string()).unwrap();
+        a.set_user_input(0, 3, 1, "=A1*2".to_string()).unwrap();
+        let mut bold = Style::default();
+        bold.font.b = true;
+        a.set_cell_style(0, 3, 1, &bold).unwrap();
+        a.set_cell_style(0, 4, 2, &bold).unwrap(); // a styled empty cell
+        a.duplicate_sheet(0).unwrap();
+        a.evaluate();
+
+        let mut b = CollabModel::new(2);
+        deliver(&mut b, 1, &a.flush());
+        b.evaluate();
+        assert_eq!(b.workbook, a.workbook);
+        for (row, col, value) in [(1, 1, "3"), (2, 1, "hi"), (3, 1, "6"), (4, 2, "")] {
+            assert_eq!(
+                a.get_formatted_cell_value(1, row, col),
+                Ok(value.to_string())
+            );
+        }
+        assert_eq!(a.get_cell_formula(1, 3, 1), Ok(Some("=A1*2".to_string())));
+        assert_eq!(a.get_cell_style_or_none(1, 3, 1), Ok(Some(bold.clone())));
+        assert_eq!(a.get_cell_style_or_none(1, 4, 2), Ok(Some(bold)));
     }
 
     #[test]

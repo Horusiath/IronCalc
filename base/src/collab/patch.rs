@@ -1277,7 +1277,8 @@ pub enum SheetIndexSeed {
 /// A complete worksheet payload, used to seed [`Patch::AddSheet`] and to restore a
 /// [`Patch::DeleteSheet`]. The sheet's name is carried by `AddSheet` itself and so is absent here.
 ///
-/// Every field is index-free — see the module documentation.
+/// Cells are addressed by ordinal within the seed's own index and point into the payload's own
+/// tables; every other field is index-free — see the module documentation.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct SheetContent {
     pub state: SheetState,
@@ -1291,10 +1292,12 @@ pub struct SheetContent {
     /// Column spans, addressed by corner keys; a [`FractionalKey::NULL`] corner is an open end, so
     /// `(NULL, NULL)` is the whole-sheet span.
     pub columns: Vec<((FractionalKey, FractionalKey), ColState)>,
-    /// Cell contents and cell styles are kept apart because most cells carry no style of their own,
-    /// and they are separate registers in any case.
-    pub cell_values: Vec<(StableCellAddress, CellInput)>,
-    pub cell_styles: Vec<(StableCellAddress, Style)>,
+    /// Ordered by `(row, column)`.
+    pub cells: Vec<SeedCell>,
+    /// The distinct cell styles, in first-use order.
+    pub styles: Vec<Style>,
+    /// The distinct texts, in first-use order.
+    pub strings: Vec<String>,
     /// The named style each parented cell points at, with the categories the cell owns rather
     /// than inherits (its overrides), ordered by address.
     pub cell_parents: Vec<(StableCellAddress, NamedStyleId, StyleIncludes)>,
@@ -1303,6 +1306,26 @@ pub struct SheetContent {
     pub links: Vec<(StableCellAddress, StableLink)>,
     /// Ordered by the [`FractionalKey`] that is each rule's identity.
     pub conditional_formatting: Vec<(FractionalKey, ConditionalFormatState)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct SeedCell {
+    pub row: u32,
+    pub column: u32,
+    /// `None` for a styled empty cell.
+    pub value: Option<SeedValue>,
+    /// Index into [`SheetContent::styles`]; `None` when the cell has no style of its own.
+    pub style: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum SeedValue {
+    Number(f64),
+    Boolean(bool),
+    Error(Error),
+    /// Index into [`SheetContent::strings`].
+    Text(u32),
+    Formula(Box<CellInput>),
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -1506,8 +1529,14 @@ mod test {
             },
             rows: vec![(key(1), row_state())],
             columns: vec![((key(3), key(4)), col_state())],
-            cell_values: vec![((key(1), key(3)), CellInput::Number(3.5))],
-            cell_styles: vec![((key(1), key(3)), Style::default())],
+            cells: vec![SeedCell {
+                row: 1,
+                column: 3,
+                value: Some(SeedValue::Number(3.5)),
+                style: Some(0),
+            }],
+            styles: vec![Style::default()],
+            strings: vec![],
             cell_parents: vec![((key(1), key(3)), 42, StyleIncludes::default())],
             merge_cells: vec![range()],
             comments: vec![((key(1), key(3)), comment())],

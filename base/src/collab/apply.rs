@@ -29,8 +29,8 @@ use crate::collab::model::{
 use crate::collab::naming::NameRepair;
 use crate::collab::patch::{
     CellInput, CfPropKind, CfProperty, ColState, DefinedNameId, DefinedNameProperty, NamedStyle,
-    NamedStyleId, NamedStyleProperty, Patch, PropKind, Property, RowState, SheetContent, SheetId,
-    SheetIndexSeed, SheetProperty, StableCfRule, StyleCategory, WorkbookProperty,
+    NamedStyleId, NamedStyleProperty, Patch, PropKind, Property, RowState, SeedValue, SheetContent,
+    SheetId, SheetIndexSeed, SheetProperty, StableCfRule, StyleCategory, WorkbookProperty,
 };
 use crate::collab::DynError;
 use crate::constants::{DEFAULT_ROW_HEIGHT, LAST_COLUMN, LAST_ROW, ROW_HEIGHT_FACTOR};
@@ -2110,20 +2110,12 @@ impl CollabModel<'_> {
                     .flat_map(|((min, max), _)| [min, max])
                     .filter(|key| !key.is_empty())
                     .collect();
-                let mut cells = Vec::with_capacity(content.cell_values.len());
-                for (at, _) in &content.cell_values {
-                    cells.push(at);
+                // Cells are addressed by ordinal: only the keyed records bring keys of their own.
+                for (row, col) in content.comments.iter().map(|(at, _)| at) {
+                    rows.push(row);
+                    cols.push(col);
                 }
-                for (at, _) in &content.cell_styles {
-                    cells.push(at);
-                }
-                for (at, _) in &content.comments {
-                    cells.push(at);
-                }
-                for (at, _) in &content.links {
-                    cells.push(at);
-                }
-                for (row, col) in cells {
+                for (row, col) in content.links.iter().map(|(at, _)| at) {
                     rows.push(row);
                     cols.push(col);
                 }
@@ -2148,43 +2140,65 @@ impl CollabModel<'_> {
         for (span, state) in &content.columns {
             self.seed_column(i, span, state, ts);
         }
-        for (at, value) in &content.cell_values {
-            self.workbook.worksheets[i]
-                .index
-                .registers
-                .cell_values
-                .insert(at.clone(), *ts);
-            self.write_cell(i, at, Some(value));
-        }
-        let mut interned: HashMap<&Style, (i32, Vec<PropKind>)> = HashMap::new();
-        for (at, style) in &content.cell_styles {
-            let (s, kinds) = match interned.get(style) {
-                Some(hit) => hit,
-                None => {
-                    let entry = (self.intern_style(style), set_kinds(style).collect());
-                    interned.entry(style).or_insert(entry)
-                }
-            };
-            let s = *s;
+        // The payload's tables, interned once; a cell names its entries by position.
+        let styles: Vec<(i32, Vec<PropKind>)> = (content.styles.iter())
+            .map(|style| (self.intern_style(style), set_kinds(style).collect()))
+            .collect();
+        let strings: Vec<i32> = (content.strings.iter())
+            .map(|text| self.intern_string(text))
+            .collect();
+        for seed in &content.cells {
             let sheet = &mut self.workbook.worksheets[i];
-            for &kind in kinds {
-                sheet
-                    .index
-                    .registers
-                    .cell_styles
-                    .insert((at.clone(), kind), *ts);
-            }
-            let Some((row, column)) = sheet.ordinal(at) else {
+            let (row, column) = (seed.row as i32, seed.column as i32);
+            // Outside the seed's index: nothing to file.
+            let (Some(r), Some(c)) = (
+                (seed.row.checked_sub(1)).and_then(|n| sheet.index.rows.key(n as usize)),
+                (seed.column.checked_sub(1)).and_then(|n| sheet.index.cols.key(n as usize)),
+            ) else {
                 continue;
             };
-            match sheet.sheet_data.cell_mut(row, column) {
-                Some(cell) => cell.set_style(s),
-                None => {
+            let at = (r.clone(), c.clone());
+            // A table entry the payload does not hold is a malformed payload.
+            let (s, kinds) = match seed.style {
+                Some(x) => {
+                    let (s, kinds) = styles.get(x as usize).ok_or(CodecError::UnexpectedEof)?;
+                    (*s, kinds.as_slice())
+                }
+                None => (0, &[][..]),
+            };
+            let registers = &mut sheet.index.registers;
+            for &kind in kinds {
+                registers.cell_styles.insert((at.clone(), kind), *ts);
+            }
+            let Some(value) = &seed.value else {
+                if s != 0 {
                     sheet
                         .sheet_data
                         .set_cell(row, column, Cell::EmptyCell { s });
                 }
-            }
+                continue;
+            };
+            registers.cell_values.insert(at.clone(), *ts);
+            let cell = match value {
+                SeedValue::Number(v) => Cell::NumberCell { v: *v, s },
+                SeedValue::Boolean(v) => Cell::BooleanCell { v: *v, s },
+                SeedValue::Error(ei) => Cell::ErrorCell { ei: ei.clone(), s },
+                SeedValue::Text(x) => Cell::SharedString {
+                    si: *strings.get(*x as usize).ok_or(CodecError::UnexpectedEof)?,
+                    s,
+                },
+                // The style first: `write_cell` keeps the one already on the cell.
+                SeedValue::Formula(input) => {
+                    if s != 0 {
+                        sheet
+                            .sheet_data
+                            .set_cell(row, column, Cell::EmptyCell { s });
+                    }
+                    self.write_cell(i, &at, Some(input));
+                    continue;
+                }
+            };
+            sheet.sheet_data.set_cell(row, column, cell);
         }
 
         let below = Timestamp::new(Hlc::new(ts.hlc.get().saturating_sub(1)), ts.session);

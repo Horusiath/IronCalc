@@ -1,3 +1,4 @@
+import re
 import sys
 
 header = r"""
@@ -22,7 +23,10 @@ def fix_types(text: str):
             if stripped == "}":
                 inside_init_output = False
             continue
-        if stripped.find("any") != -1:
+        # Doc comments are copied from the Rust sources and may use the word.
+        if stripped.startswith(("/**", "*", "//")):
+            continue
+        if re.search(r"\bany\b", stripped):
             print("There are 'unfixed' public types. Please check.")
             exit(1)
 

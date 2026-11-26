@@ -479,6 +479,16 @@ impl CollabModel<'_> {
             .map(|ws| ws.get_name())
             .unwrap_or_default();
         let mut node = parse_shape(text, &sheet, host.row, host.column);
+        // Raw text the full parser rejected has no slots: if the name-blind parse finds leaves in
+        // it anyway, it stays a parse error, as in the ordinal model.
+        if refs.is_empty() && !leaves(&node).is_empty() {
+            return Node::ParseErrorKind {
+                formula: text.to_string(),
+                message: "Invalid formula".to_string(),
+                position: 0,
+                expecting: Vec::new(),
+            };
+        }
         self.overwrite_leaves(&mut node, refs, host);
         node
     }
@@ -1372,6 +1382,48 @@ mod test {
                 b.get_formatted_cell_value(0, row, 3),
                 "{text}"
             );
+        }
+    }
+
+    /// A LAMBDA parameter named like a defined name is a parse error to the full parser but not to
+    /// the name-blind one: the text stays as typed and errors, as in the ordinal model and on a
+    /// peer. So does a plain parse error.
+    #[test]
+    fn lambda_parameter_shadowing_a_name_keeps_the_text() {
+        let mut o = Model::new_empty("model", "en", "UTC", "en").unwrap();
+        let mut a = CollabModel::new(1);
+        a.new_sheet();
+        o.new_defined_name("a", None, "Sheet1!$F$2").unwrap();
+        a.new_defined_name("a", None, "Sheet1!$F$2").unwrap();
+        let cases = [(1, "=LAMBDA(a,b,a*b)(2,3)"), (2, "=1+")];
+        for (row, text) in cases {
+            o.set_user_input(0, row, 1, text.to_string()).unwrap();
+            a.set_user_input(0, row, 1, text.to_string()).unwrap();
+        }
+        let mut b = CollabModel::new(2);
+        b.apply_batch(&a.flush()).unwrap();
+        o.evaluate();
+        a.evaluate();
+        b.evaluate();
+        for (row, text) in cases {
+            let formula = o.get_cell_formula(0, row, 1).unwrap();
+            let value = o.get_formatted_cell_value(0, row, 1).unwrap();
+            assert_eq!(formula.as_deref(), Some(text), "{text}");
+            assert_eq!(value, "#ERROR!", "{text}");
+            for c in [&a, &b] {
+                assert_eq!(c.get_cell_formula(0, row, 1).unwrap(), formula, "{text}");
+                assert_eq!(c.get_formatted_cell_value(0, row, 1).unwrap(), value);
+            }
+        }
+        // The cell recovers once a valid formula replaces the text.
+        a.cell_clear_contents(0, 1, 1).unwrap();
+        a.set_user_input(0, 1, 1, "=LAMBDA(x,y,x*y)(2,3)".to_string())
+            .unwrap();
+        b.apply_batch(&a.flush()).unwrap();
+        a.evaluate();
+        b.evaluate();
+        for c in [&a, &b] {
+            assert_eq!(c.get_formatted_cell_value(0, 1, 1), Ok("6".to_string()));
         }
     }
 
